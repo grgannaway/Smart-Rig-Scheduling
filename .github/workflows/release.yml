@@ -1,0 +1,21 @@
+name: "Create New Release"
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  pypi-release:
+    runs-on: ubuntu-latest
+    concurrency: release
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: coterra-data-analysis/deployment/actions/pypi-release@v3.3
+        with:
+          github-token: ${{ secrets.RUNNER_CLASSIC_PAT }}
+          repository-username: ${{ secrets.AZURE_PYPI_USERNAME }}
+          repository-password: ${{ secrets.AZURE_PYPI_PASSWORD }}

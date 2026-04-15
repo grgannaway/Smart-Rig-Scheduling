@@ -1,0 +1,35 @@
+{
+  "files.exclude": {
+    "__pycache__": true,
+    ".git": true,
+    ".history": true,
+    ".ipynb_checkpoints": true,
+    ".pytest_cache": true,
+    ".ruff_cache": true,
+  },
+  "git.repositoryScanMaxDepth": 3,
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  "notebook.formatOnSave.enabled": true,
+  "notebook.codeActionsOnSave": {
+    "notebook.source.fixAll": "explicit",
+    "notebook.source.organizeImports": "explicit"
+  },
+  "python.defaultInterpreterPath": "${env:PYTHON_INTERPRETER_PATH}",
+  "python.testing.unittestEnabled": false,
+  "python.testing.pytestEnabled": true,
+  "python.languageServer": "Pylance",
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.typeCheckingMode": "off",
+  "[python]": {
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll": "always",
+      "source.organizeImports": "always"
+    },
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  "debugpy.debugJustMyCode": false,
+  "ruff.importStrategy": "fromEnvironment",
+}

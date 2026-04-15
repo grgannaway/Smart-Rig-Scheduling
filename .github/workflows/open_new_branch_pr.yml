@@ -1,0 +1,16 @@
+name: Open PR on Branch Creation
+
+on:
+  push:
+    branches-ignore:
+      - "main"
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create PR
+        uses: coterra-data-analysis/deployment/actions/trigger-new-branch-pr@v2.4
+        with:
+          github-token: ${{ secrets.RUNNER_CLASSIC_PAT }}
+          args: "--draft"

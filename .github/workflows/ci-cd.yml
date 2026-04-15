@@ -1,0 +1,55 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: ["main"]
+
+# only allow one job to run at a time for this PR
+concurrency:
+  group: ${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest-4-cores
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: coterra-data-analysis/deployment/actions/test-and-publish@v3.12.0 #repo must be accessible to full org
+        with:
+          # more parameters can be found in the action's yml file
+          check-name: Unit Tests
+          image-name: ${{ github.event.repository.name }}
+          registry-username: ${{ secrets.ACR_ADMIN_USERNAME }}
+          registry-password: ${{ secrets.ACR_ADMIN_PASSWORD }}
+          repository-username: ${{ secrets.AZURE_PYPI_USERNAME }}
+          repository-password: ${{ secrets.AZURE_PYPI_PASSWORD }}
+
+  pre-release:
+    runs-on: ubuntu-latest
+    concurrency: release
+    needs: test-and-publish
+    outputs:
+      pre-release-version: ${{ steps.prerelease.outputs.pre-release-version }}  
+    permissions:
+      contents: read
+      issues: read
+      checks: write
+      pull-requests: write
+    steps:
+      - name: Generate Pre-Release Version
+        uses: coterra-data-analysis/deployment/actions/pypi-prerelease@v3.11.2
+        id: prerelease
+        with:
+          github-token: ${{ secrets.RUNNER_CLASSIC_PAT }}
+          repository-name: "ml-tools"
+          repository-username: ${{ secrets.AZURE_PYPI_USERNAME }}
+          repository-password: ${{ secrets.AZURE_PYPI_PASSWORD }}
+      - name: Set Pre-Release Version Output
+        run: echo 'pre-release-version="$PRERELEASE"' >> "$GITHUB_ENV"
+        shell: bash
+        env:
+          PRERELEASE: ${{ steps.prerelease.outputs.pre-release-version }}
