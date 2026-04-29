@@ -1,0 +1,5 @@
+﻿__pycache__/
+*.pyc
+.tmp_uploads/
+streamlit_ga_app_v1_1/outputs/
+streamlit_ga_app_v1_1/.tmp_uploads/
