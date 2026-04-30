@@ -3513,10 +3513,18 @@ def main():
         if n_days > 0:
             start = pd.to_datetime(config.simulation_start_date)
             dates = pd.date_range(start, periods=n_days, freq="D")
+            base_water_daily = np.zeros(n_days)
+            if base_water is not None:
+                base_n = min(n_days, len(base_water))
+                base_water_daily[:base_n] = np.asarray(base_water[:base_n], dtype=float)
+            produced_water_daily = np.asarray(final_sim.daily_water_produced_bbl, dtype=float)
+            new_pad_water_daily = produced_water_daily - base_water_daily
             water_df = pd.DataFrame({
                 "date":                       dates,
                 "day":                        np.arange(n_days),
                 "produced_water_bbl":         final_sim.daily_water_produced_bbl,
+                "base_water_production_bbl":  base_water_daily,
+                "new_pad_water_production_bbl": new_pad_water_daily,
                 "rainfall_bbl":               final_sim.daily_water_rainfall_bbl,
                 "to_frac_bbl":                final_sim.daily_water_to_frac_bbl,
                 "to_company_storage_bbl":     final_sim.daily_water_to_company_storage_bbl,
