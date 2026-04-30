@@ -133,40 +133,19 @@ _NET_BASE = (
     r"\Optimization Engineering\Digital Innovation\Operations Research\MBU"
     r"\v2_Rig Scheduler"
 )
-
-# Detect environments where the corporate network share is unreachable
-# (Streamlit Cloud, any non-Windows host, or a local Windows box that isn't
-# on the corporate network). When unreachable, blank out the input defaults
-# and point outputs at a writable local folder so the app boots cleanly.
-_NETWORK_AVAILABLE = os.path.isdir(_NET_BASE)
-_LOCAL_OUTPUT_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
-)
-
-if _NETWORK_AVAILABLE:
-    default_paths = {
-        "pad":        rf"{_NET_BASE}\v2_Schedule.csv",
-        "well":       rf"{_NET_BASE}\v2_Schedule_decline_curve_parameters_with_water.csv",
-        "base_prod":  rf"{_NET_BASE}\v2_base_production.csv",
-        "min_vol":    rf"{_NET_BASE}\v1_minimum_volumes.csv",
-    }
-    default_output_root = rf"{_NET_BASE}\GA_Outputs"
-else:
-    default_paths = {"pad": "", "well": "", "base_prod": "", "min_vol": ""}
-    default_output_root = _LOCAL_OUTPUT_DIR
+default_paths = {
+    "pad":        rf"{_NET_BASE}\v2_Schedule.csv",
+    "well":       rf"{_NET_BASE}\v2_Schedule_decline_curve_parameters_with_water.csv",
+    "base_prod":  rf"{_NET_BASE}\v2_base_production.csv",
+    "min_vol":    rf"{_NET_BASE}\v1_minimum_volumes.csv",
+}
 
 # ----- 📁 Input CSVs --------------------------------------------------------
 with st.sidebar.expander("📁 Input CSVs", expanded=False):
-    if _NETWORK_AVAILABLE:
-        st.caption(
-            "Defaults match the production network paths used by the engine. "
-            "**Upload** a CSV to override any one, or edit the path text box."
-        )
-    else:
-        st.warning(
-            "Corporate network share not reachable from this host — you must "
-            "**upload** all four CSVs below. (Path text boxes are blank by default.)"
-        )
+    st.caption(
+        "Defaults match the production network paths used by the engine. "
+        "**Upload** a CSV to override any one, or edit the path text box."
+    )
     up_pad   = st.file_uploader("Pad schedule CSV (override)",        type=["csv"], key="up_pad")
     pad_path = st.text_input("…or pad CSV path",                      value=default_paths["pad"])
 
@@ -180,10 +159,10 @@ with st.sidebar.expander("📁 Input CSVs", expanded=False):
     min_path = st.text_input("…or minimum volumes path",               value=default_paths["min_vol"])
 
 
-# ----- 📤 Output Destination ------------------------------------------------
-# Default to the network share when reachable, otherwise a local `./outputs`
-# folder next to this script. Each run is written into a timestamped subfolder
-# so prior runs are preserved.
+# ----- � Output Destination ------------------------------------------------
+# Default to the same network share as the inputs, under a `GA_Outputs` subfolder.
+# Each run is written into a timestamped subfolder so prior runs are preserved.
+default_output_root = rf"{_NET_BASE}\GA_Outputs"
 with st.sidebar.expander("📤 Output Destination", expanded=False):
     st.caption(
         "Folder where this run's plots and CSVs will be written. "
@@ -193,9 +172,8 @@ with st.sidebar.expander("📤 Output Destination", expanded=False):
         "Output root folder",
         value=default_output_root,
         help=(
-            "Default is the production network share when reachable, otherwise "
-            "a local `./outputs` folder next to the app. Point this at any "
-            "writable local or network folder."
+            "Default is the production network share. Point this at any local or "
+            "network folder (e.g. `C:\\Users\\you\\Downloads\\GA_runs`)."
         ),
     )
     use_timestamp_subfolder = st.checkbox(
