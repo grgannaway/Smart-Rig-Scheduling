@@ -515,9 +515,9 @@ if run_clicked:
             pads = load_pads_from_csv(config.pad_filepath, config.simulation_start_date)
             wells = load_wells_from_csv(config.well_filepath)
             assign_wells_to_pads(pads, wells)
-            base_prod  = load_base_production(config.base_production_filepath, config.simulation_days)
-            min_vols   = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days)
-            base_water = load_base_water(config.base_production_filepath, config.simulation_days)
+            base_prod  = load_base_production(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
+            min_vols   = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days, config.simulation_start_date)
+            base_water = load_base_water(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
             print(f"Loaded {len(pads)} pads, {sum(len(p.wells) for p in pads)} wells assigned.")
 
             progress.progress(0.05, text="Inputs loaded — starting GA")
