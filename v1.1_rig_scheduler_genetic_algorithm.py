@@ -429,7 +429,8 @@ class SimConfig:
 
 def _load_time_series_csv(filepath: str, simulation_days: int,
                           tail_fill: bool = False,
-                          rate_keywords: Optional[List[str]] = None) -> np.ndarray:
+                          rate_keywords: Optional[List[str]] = None,
+                          simulation_start_date: Optional[str] = None) -> np.ndarray:
     """Load a daily/monthly time series from CSV.
 
     rate_keywords: list of substrings (lowercased) used to identify the rate column.
@@ -455,30 +456,39 @@ def _load_time_series_csv(filepath: str, simulation_days: int,
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.sort_values(date_col).reset_index(drop=True)
     df["rate"] = pd.to_numeric(df[rate_col], errors="coerce").fillna(0)
-    ref_date = df[date_col].iloc[0]
+    ref_date = pd.Timestamp(simulation_start_date) if simulation_start_date else df[date_col].iloc[0]
     arr = np.zeros(simulation_days)
-    for _, row in df.iterrows():
-        ds = max(0, (row[date_col] - ref_date).days)
-        de = min(simulation_days, (row[date_col] + pd.offsets.MonthBegin(1) - ref_date).days)
-        if ds < simulation_days:
-            arr[ds:de] = row["rate"]
+    for i in range(len(df)):
+        row_date = df.at[i, date_col]
+        row_rate = float(df.at[i, "rate"])
+        if i + 1 < len(df):
+            next_date = df.at[i + 1, date_col]
+        else:
+            next_date = row_date + pd.offsets.MonthBegin(1)
+        ds = max(0, (row_date - ref_date).days)
+        de = min(simulation_days, (next_date - ref_date).days)
+        if ds < simulation_days and de > ds:
+            arr[ds:de] = row_rate
     if tail_fill:
         lv = df["rate"].iloc[-1]
-        ld = min(simulation_days, (df[date_col].iloc[-1] - ref_date).days + 30)
+        ld = min(simulation_days, (df[date_col].iloc[-1] + pd.offsets.MonthBegin(1) - ref_date).days)
         if ld < simulation_days:
             arr[ld:] = lv
     return arr
 
 
-def load_base_production(filepath: str, simulation_days: int) -> np.ndarray:
+def load_base_production(filepath: str, simulation_days: int,
+                         simulation_start_date: Optional[str] = None) -> np.ndarray:
     """Base GAS production (MCFD) from the base production CSV."""
     arr = _load_time_series_csv(filepath, simulation_days, tail_fill=True,
-                                 rate_keywords=["gas rate", "mcfd", "rate"])
+                                 rate_keywords=["gas rate", "mcfd", "rate"],
+                                 simulation_start_date=simulation_start_date)
     print(f"Base gas production: {arr[0]:,.0f} → {arr[-1]:,.0f} MCFD")
     return arr
 
 
-def load_base_water(filepath: str, simulation_days: int) -> np.ndarray:
+def load_base_water(filepath: str, simulation_days: int,
+                    simulation_start_date: Optional[str] = None) -> np.ndarray:
     """Base WATER production (BWPD) from the base production CSV."""
     try:
         df = pd.read_csv(filepath, encoding="utf-8-sig")
@@ -489,7 +499,8 @@ def load_base_water(filepath: str, simulation_days: int) -> np.ndarray:
             print("Base water production: no Water Rate column found — using zeros.")
             return np.zeros(simulation_days)
         arr = _load_time_series_csv(filepath, simulation_days, tail_fill=True,
-                                     rate_keywords=["water rate", "bwpd", "bbl"])
+                         rate_keywords=["water rate", "bwpd", "bbl"],
+                         simulation_start_date=simulation_start_date)
         print(f"Base water production: {arr[0]:,.0f} → {arr[-1]:,.0f} BWPD")
         return arr
     except Exception as e:
@@ -497,8 +508,10 @@ def load_base_water(filepath: str, simulation_days: int) -> np.ndarray:
         return np.zeros(simulation_days)
 
 
-def load_minimum_volumes(filepath: str, simulation_days: int) -> np.ndarray:
-    arr = _load_time_series_csv(filepath, simulation_days, tail_fill=False)
+def load_minimum_volumes(filepath: str, simulation_days: int,
+                         simulation_start_date: Optional[str] = None) -> np.ndarray:
+    arr = _load_time_series_csv(filepath, simulation_days, tail_fill=False,
+                                simulation_start_date=simulation_start_date)
     print(f"Minimum volumes: {arr[0]:,.0f} MCFD, {int(np.sum(arr > 0) / 30)} months")
     return arr
 
@@ -3351,9 +3364,21 @@ def main():
     wells = load_wells_from_csv(config.well_filepath)
     assign_wells_to_pads(pads, wells)
 
-    base_production = load_base_production(config.base_production_filepath, config.simulation_days)
-    minimum_volumes = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days)
-    base_water      = load_base_water(config.base_production_filepath, config.simulation_days)  # optional
+    base_production = load_base_production(
+        config.base_production_filepath,
+        config.simulation_days,
+        config.simulation_start_date,
+    )
+    minimum_volumes = load_minimum_volumes(
+        config.minimum_volume_filepath,
+        config.simulation_days,
+        config.simulation_start_date,
+    )
+    base_water = load_base_water(
+        config.base_production_filepath,
+        config.simulation_days,
+        config.simulation_start_date,
+    )  # optional
 
     print(f"\nLoaded: {len(pads)} pads, {sum(len(p.wells) for p in pads)} wells matched.\n")
 
