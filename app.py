@@ -51,6 +51,7 @@ from v1_1_rig_scheduler_genetic_algorithm import (  # noqa: E402
     _add_net_fcf_columns,
     make_diagnostic_plots,
     plot_final_results,
+    WATER_OUTLET_CASCADE,
 )
 
 
@@ -618,10 +619,18 @@ if run_clicked:
             if n_days > 0:
                 start = pd.to_datetime(config.simulation_start_date)
                 dates = pd.date_range(start, periods=n_days, freq="D")
+                base_water_daily = np.zeros(n_days)
+                if base_water is not None:
+                    base_n = min(n_days, len(base_water))
+                    base_water_daily[:base_n] = np.asarray(base_water[:base_n], dtype=float)
+                produced_water_daily = np.asarray(final_sim.daily_water_produced_bbl, dtype=float)
+                new_pad_water_daily = produced_water_daily - base_water_daily
                 water_df = pd.DataFrame({
-                    "date": dates,
-                    "day": np.arange(n_days),
+                    "date":                       dates,
+                    "day":                        np.arange(n_days),
                     "produced_water_bbl":         final_sim.daily_water_produced_bbl,
+                    "base_water_production_bbl":  base_water_daily,
+                    "new_pad_water_production_bbl": new_pad_water_daily,
                     "rainfall_bbl":               final_sim.daily_water_rainfall_bbl,
                     "to_frac_bbl":                final_sim.daily_water_to_frac_bbl,
                     "to_company_storage_bbl":     final_sim.daily_water_to_company_storage_bbl,
@@ -636,11 +645,143 @@ if run_clicked:
                     "thirdparty_storage_level_bbl": final_sim.daily_thirdparty_storage_bbl,
                     "water_cost_mm":              final_sim.daily_water_cost_mm,
                 })
+                water_df["supply_bbl"] = (water_df["produced_water_bbl"]
+                                           + water_df["rainfall_bbl"])
+                water_df["disposed_bbl"] = (water_df["to_frac_bbl"]
+                                             + water_df["to_company_storage_bbl"]
+                                             + water_df["to_thirdparty_storage_bbl"]
+                                             + water_df["water_sharing_bbl"]
+                                             + water_df["select_rail_bbl"]
+                                             + water_df["pa_swd_bbl"]
+                                             + water_df["remainder_bbl"]
+                                             + water_df["unhandled_bbl"])
                 water_df.to_csv(config.water_output, index=False)
             else:
                 water_df = pd.DataFrame()
 
             history_df = optimizer.history_df()
+
+            # ---- GA convergence CSV
+            if not history_df.empty:
+                hist_path = os.path.join(config.plot_output_folder, "ga_convergence.csv")
+                history_df.to_csv(hist_path, index=False)
+
+            # ---- Per-pad-by-month FCF & production breakdown + per-pad summary
+            try:
+                from typing import Dict as _Dict
+                n_days_sim = config.simulation_days
+                n_months = n_days_sim // 30 + 1
+                r = ga_config.discount_rate_annual
+                price = config.commodity_price_per_mcf
+                days_in_month = 30
+                df_month = (1.0 + r) ** (-np.arange(n_months) / 12.0)
+
+                outlet_caps = [
+                    (getattr(config, cap), getattr(config, cost))
+                    for _key, _lab, cap, cost in WATER_OUTLET_CASCADE
+                ]
+                tot_cap = sum(c for c, _ in outlet_caps)
+                avg_disp_cost = (sum(c * p for c, p in outlet_caps) / tot_cap) if tot_cap > 0 else 0.0
+
+                pad_month_rows = []
+                for p in final_sim.pads:
+                    reserved = getattr(p, "_reserved_starts", None)
+                    def _start(default, ms_key):
+                        if reserved is not None and ms_key in reserved:
+                            return reserved[ms_key]
+                        return default
+                    capex_by_month: dict = {}
+                    milestones = [
+                        (_start(p.land_start,      "land"),             p.capex_land_mm,             p.land_owner_agreement_days),
+                        (_start(p.permit_start,    "permit"),           p.capex_permit_mm,           p.pad_permit_days),
+                        (_start(p.pad_con_start,   "pad_construction"), p.capex_pad_construction_mm, p.pad_construction_days),
+                        (_start(p.midstream_start, "midstream"),        p.capex_midstream_mm,        p.midstream_construction_days),
+                        (_start(p.overland_start,  "overland"),         p.capex_overland_mm,         p.overland_construction_days),
+                        (_start(p.drill_start,     "drill"),            p.capex_drill_mm,            p.drill_days),
+                        (_start(p.frac_start,      "frac"),             p.capex_frac_mm,             p.frac_days),
+                    ]
+                    mode = getattr(config, "capex_disbursement", "even")
+                    for s, amt, dur in milestones:
+                        if not amt or amt <= 0 or s is None:
+                            continue
+                        if mode == "lump_start" or dur is None or dur <= 0:
+                            mi = int(s) // 30
+                            capex_by_month[mi] = capex_by_month.get(mi, 0.0) + float(amt)
+                            continue
+                        n_days_ms = max(1, int(np.ceil(float(dur))))
+                        per_day = float(amt) / n_days_ms
+                        written = 0.0
+                        for k in range(n_days_ms):
+                            d = int(s) + k
+                            if k == n_days_ms - 1:
+                                today = float(amt) - written
+                            else:
+                                today = per_day
+                                written += per_day
+                            mi = d // 30
+                            capex_by_month[mi] = capex_by_month.get(mi, 0.0) + today
+
+                    for mi in range(n_months):
+                        sample_day = mi * 30 + 15
+                        if sample_day >= n_days_sim:
+                            break
+                        prod_mcfd = p.production_at_day(sample_day)
+                        water_bwpd = p.water_production_at_day(sample_day)
+                        revenue_mm = prod_mcfd * days_in_month * price / 1e6
+                        is_producing = (p.first_production_day is not None
+                                        and sample_day >= p.first_production_day)
+                        opex_mm = (p.annual_opex_mm / 12.0) if is_producing else 0.0
+                        capex_mm = capex_by_month.get(mi, 0.0)
+                        water_cost_mm = water_bwpd * days_in_month * avg_disp_cost / 1e6
+                        fcf_mm = revenue_mm - opex_mm - capex_mm - water_cost_mm
+                        fcf_pv_mm = fcf_mm * df_month[mi]
+                        pad_month_rows.append({
+                            "pad": p.name,
+                            "drill_position": p.sequence_number,
+                            "pvi": p.pvi,
+                            "npv_mm_input": p.npv_mm,
+                            "is_mandatory": p.is_mandatory,
+                            "first_production_day": p.first_production_day,
+                            "first_production_month": (p.first_production_day // 30
+                                                       if p.first_production_day is not None else None),
+                            "month": mi,
+                            "year": mi // 12,
+                            "production_mcfd": round(prod_mcfd, 1),
+                            "water_bwpd": round(water_bwpd, 1),
+                            "revenue_mm": round(revenue_mm, 4),
+                            "opex_mm": round(opex_mm, 4),
+                            "capex_mm": round(capex_mm, 4),
+                            "water_cost_mm": round(water_cost_mm, 4),
+                            "fcf_mm": round(fcf_mm, 4),
+                            "fcf_pv_mm": round(fcf_pv_mm, 4),
+                        })
+
+                pad_month_df = pd.DataFrame(pad_month_rows)
+                pm_path = os.path.join(config.plot_output_folder, "pad_month_fcf_production.csv")
+                pad_month_df.to_csv(pm_path, index=False)
+
+                pad_summary = (pad_month_df.groupby(
+                    ["pad", "drill_position", "pvi", "npv_mm_input",
+                     "is_mandatory", "first_production_day", "first_production_month"])
+                    .agg(
+                        total_production_mcf=("production_mcfd",
+                                              lambda s: float(s.sum() * days_in_month)),
+                        peak_mcfd=("production_mcfd", "max"),
+                        total_revenue_mm=("revenue_mm", "sum"),
+                        total_opex_mm=("opex_mm", "sum"),
+                        total_capex_mm=("capex_mm", "sum"),
+                        total_water_cost_mm=("water_cost_mm", "sum"),
+                        total_fcf_mm=("fcf_mm", "sum"),
+                        pv_fcf_mm=("fcf_pv_mm", "sum"),
+                    )
+                    .reset_index()
+                    .sort_values("drill_position"))
+                pad_summary["pv_drag_mm"] = pad_summary["total_fcf_mm"] - pad_summary["pv_fcf_mm"]
+                pad_summary["pv_fcf_per_pvi"] = pad_summary["pv_fcf_mm"] / pad_summary["pvi"].replace(0, np.nan)
+                ps_path = os.path.join(config.plot_output_folder, "pad_summary_pvi_vs_fcf.csv")
+                pad_summary.to_csv(ps_path, index=False)
+            except Exception as ex:  # noqa: BLE001
+                print(f"  (per-pad FCF CSV error: {ex})")
 
             # ---- Render the full engine plot dashboard into plot_output_folder
             try:
@@ -696,6 +837,7 @@ if run_clicked:
         "history_df":     history_df,
         "per_gen":        per_gen,
         "elapsed":        elapsed,
+        "base_water":     base_water,
     }
 
 
@@ -739,15 +881,23 @@ def _render_pvi_vs_order(order, sim, label_prefix=""):
     st.pyplot(fig, clear_figure=True)
 
 
-def _build_water_df(sim, sim_start_date):
+def _build_water_df(sim, sim_start_date, base_water=None):
     n = len(sim.daily_water_produced_bbl)
     if n == 0:
         return pd.DataFrame()
     start = pd.to_datetime(sim_start_date)
-    return pd.DataFrame({
+    base_water_daily = np.zeros(n)
+    if base_water is not None:
+        base_n = min(n, len(base_water))
+        base_water_daily[:base_n] = np.asarray(base_water[:base_n], dtype=float)
+    produced_water_daily = np.asarray(sim.daily_water_produced_bbl, dtype=float)
+    new_pad_water_daily = produced_water_daily - base_water_daily
+    wdf = pd.DataFrame({
         "date": pd.date_range(start, periods=n, freq="D"),
         "day": np.arange(n),
         "produced_water_bbl":         sim.daily_water_produced_bbl,
+        "base_water_production_bbl":  base_water_daily,
+        "new_pad_water_production_bbl": new_pad_water_daily,
         "rainfall_bbl":               sim.daily_water_rainfall_bbl,
         "to_frac_bbl":                sim.daily_water_to_frac_bbl,
         "to_company_storage_bbl":     sim.daily_water_to_company_storage_bbl,
@@ -762,10 +912,20 @@ def _build_water_df(sim, sim_start_date):
         "thirdparty_storage_level_bbl": sim.daily_thirdparty_storage_bbl,
         "water_cost_mm":              sim.daily_water_cost_mm,
     })
+    wdf["supply_bbl"] = wdf["produced_water_bbl"] + wdf["rainfall_bbl"]
+    wdf["disposed_bbl"] = (wdf["to_frac_bbl"]
+                            + wdf["to_company_storage_bbl"]
+                            + wdf["to_thirdparty_storage_bbl"]
+                            + wdf["water_sharing_bbl"]
+                            + wdf["select_rail_bbl"]
+                            + wdf["pa_swd_bbl"]
+                            + wdf["remainder_bbl"]
+                            + wdf["unhandled_bbl"])
+    return wdf
 
 
-def _render_water_balance(sim, sim_start_date, label_prefix=""):
-    wdf = _build_water_df(sim, sim_start_date)
+def _render_water_balance(sim, sim_start_date, label_prefix="", base_water=None):
+    wdf = _build_water_df(sim, sim_start_date, base_water=base_water)
     if wdf.empty:
         st.caption("(no water data)")
         return
@@ -834,6 +994,7 @@ if "last_run" in st.session_state:
     per_gen       = state["per_gen"]
     out_dir       = state["out_dir"]
     elapsed       = state["elapsed"]
+    base_water    = state.get("base_water")
 
     st.success(f"GA finished in {elapsed:,.1f}s — output folder: `{out_dir}`")
 
@@ -919,6 +1080,9 @@ if "last_run" in st.session_state:
             ("Pad schedule (all generations)", config.schedule_output),
             ("Monthly results",                config.monthly_output),
             ("Water mass balance",             config.water_output),
+            ("GA convergence history",         os.path.join(config.plot_output_folder, "ga_convergence.csv")),
+            ("Per-pad monthly FCF/production", os.path.join(config.plot_output_folder, "pad_month_fcf_production.csv")),
+            ("Per-pad summary (PVI vs FCF)",   os.path.join(config.plot_output_folder, "pad_summary_pvi_vs_fcf.csv")),
         ]
         for label, path in files:
             if path and os.path.exists(path):
@@ -1027,7 +1191,8 @@ if "last_run" in st.session_state:
 
             st.subheader("Water mass balance")
             _render_water_balance(sim_g, config.simulation_start_date,
-                                  label_prefix=f"{scenario_label} — ")
+                                  label_prefix=f"{scenario_label} — ",
+                                  base_water=base_water)
 
             # CSV downloads for this scenario
             st.subheader(f"Downloads ({scenario_label})")
@@ -1038,7 +1203,7 @@ if "last_run" in st.session_state:
                 f"Pad order — {scenario_label}", order_df,
                 f"pad_order_{key_tag}.csv", key=f"dl_order_{key_tag}",
             )
-            wdf = _build_water_df(sim_g, config.simulation_start_date)
+            wdf = _build_water_df(sim_g, config.simulation_start_date, base_water=base_water)
             if not wdf.empty:
                 _df_download_button(
                     f"Water mass balance — {scenario_label}", wdf,
