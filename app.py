@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 _ENGINE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ENGINE_DIR))
 
-from v1_1_rig_scheduler_genetic_algorithm import (  # noqa: E402
+from v1_2_rig_scheduler_genetic_algorithm import (  # noqa: E402
     SimConfig,
     GAConfig,
     GeneticAlgorithmOptimizer,
@@ -203,6 +203,12 @@ with st.sidebar.expander("💰 Capital & Production Limits", expanded=False):
     st.markdown("**Annual capex (base year)**")
     annual_capex     = st.number_input("Annual capex limit ($MM)", 0.0, 5000.0, 350.0, step=25.0)
     capex_tol        = st.number_input("Capex tolerance ($MM)", 0.0, 500.0, 10.0, step=5.0)
+    year_1_override  = st.number_input(
+        "Year 1 capex limit override ($MM, 0 = use formula)", 0.0, 5000.0, 0.0, step=25.0,
+        help="Explicit capex ceiling for year 1 (sim start \u2192 12/31). "
+             "0 = use the standard annual limit / CAGR formula. "
+             "Useful when pre-approved pads drive a different year-1 capital profile.",
+    )
     capex_cagr_pct   = st.number_input("Capex CAGR (% / yr)", -50.0, 50.0, 0.0, step=0.5)
     capex_cagr_years = st.number_input("Capex CAGR years", 0, 50, 0)
 
@@ -422,6 +428,7 @@ if run_clicked:
         # Capital
         annual_capex_limit_mm=float(annual_capex),
         capex_tolerance_mm=float(capex_tol),
+        year_1_capex_limit_mm=float(year_1_override) if year_1_override > 0 else None,
         capex_cagr_pct=float(capex_cagr_pct),
         capex_cagr_years=int(capex_cagr_years),
         # OL/MS sub-budget
@@ -965,6 +972,30 @@ def _render_monthly_fcf(monthly_df, label_prefix=""):
     st.pyplot(fig, clear_figure=True)
 
 
+def _render_cumulative_fcf(monthly_df, label_prefix="", baseline_df=None, baseline_label="PVI baseline"):
+    """Cumulative FCF line chart — net of capital, opex, water cost, and
+    gas-shortfall penalty.  PVI delay penalty is excluded (fitness-only)."""
+    if monthly_df is None or monthly_df.empty:
+        return
+    # Prefer the NET column (includes water + shortfall deductions)
+    cum_col = ("cumulative_fcf_net_mm" if "cumulative_fcf_net_mm" in monthly_df.columns
+               else ("cumulative_fcf_mm" if "cumulative_fcf_mm" in monthly_df.columns else None))
+    if cum_col is None:
+        return
+    fig, ax = plt.subplots(figsize=(10, 4))
+    x = monthly_df["month"] if "month" in monthly_df.columns else np.arange(len(monthly_df))
+    ax.plot(x, monthly_df[cum_col], "g-", lw=2.5, label="GA best")
+    if baseline_df is not None and cum_col in baseline_df.columns:
+        xb = baseline_df["month"] if "month" in baseline_df.columns else np.arange(len(baseline_df))
+        ax.plot(xb, baseline_df[cum_col], color="purple", ls="--", lw=1.8, label=baseline_label)
+    ax.axhline(0, color="gray", lw=0.8, ls=":")
+    ax.set_xlabel("Month"); ax.set_ylabel("Cumulative FCF ($MM)")
+    net_tag = " (net of capex, opex, water, shortfall)" if cum_col == "cumulative_fcf_net_mm" else ""
+    ax.set_title(f"{label_prefix}Cumulative FCF{net_tag}".strip(), fontsize=11)
+    ax.legend(loc="lower right"); ax.grid(alpha=0.3)
+    st.pyplot(fig, clear_figure=True)
+
+
 def _render_pad_order_table(order, sim):
     pad_lookup = {p.name: p for p in sim.pads}
     df = pd.DataFrame({
@@ -1071,6 +1102,10 @@ if "last_run" in st.session_state:
             ax.set_xlabel("Generation"); ax.set_ylabel("NPV score ($MM)")
             ax.grid(alpha=0.3); ax.legend()
             st.pyplot(fig, clear_figure=True)
+
+        st.subheader("Cumulative FCF")
+        _render_cumulative_fcf(final_monthly, baseline_df=bench_monthly,
+                               baseline_label="PVI-rank baseline")
 
         st.subheader("Best pad ordering")
         _render_pad_order_table(best_order, final_sim)
@@ -1188,6 +1223,9 @@ if "last_run" in st.session_state:
 
             st.subheader("Monthly FCF")
             _render_monthly_fcf(monthly_g, label_prefix=f"{scenario_label} — ")
+
+            st.subheader("Cumulative FCF")
+            _render_cumulative_fcf(monthly_g, label_prefix=f"{scenario_label} — ")
 
             st.subheader("Water mass balance")
             _render_water_balance(sim_g, config.simulation_start_date,
