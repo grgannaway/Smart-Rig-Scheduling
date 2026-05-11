@@ -3724,8 +3724,34 @@ def main():
         # ---- Final solution
         all_rows.extend(_pad_rows(final_sim.pads, "final solution"))
 
-        pd.DataFrame(all_rows).to_csv(config.schedule_output, index=False)
+        sched_df = pd.DataFrame(all_rows)
+        sched_df.to_csv(config.schedule_output, index=False)
         print(f"  -> wrote pad schedule:  {config.schedule_output}")
+
+        # Also write a dates version of the schedule
+        day_cols = [
+            "mandatory_start_day",
+            "land_start", "land_end",
+            "permit_start", "permit_end",
+            "pad_con_start", "pad_con_end",
+            "midstream_start", "midstream_end",
+            "overland_start", "overland_end",
+            "drill_start", "drill_end",
+            "frac_start", "frac_end",
+            "first_production_day",
+        ]
+        sim_start = pd.to_datetime(config.simulation_start_date)
+        dates_df = sched_df.copy()
+        for col in day_cols:
+            if col in dates_df.columns:
+                dates_df[col] = dates_df[col].apply(
+                    lambda d: (sim_start + pd.Timedelta(days=int(d))).strftime("%Y-%m-%d")
+                    if pd.notna(d) and d != "" and d is not None else ""
+                )
+        base, ext = os.path.splitext(config.schedule_output)
+        dates_path = f"{base}_dates{ext}"
+        dates_df.to_csv(dates_path, index=False)
+        print(f"  -> wrote pad schedule (dates): {dates_path}")
 
     # ---- Daily water mass-balance CSV (final solution only) ---------------
     if getattr(config, "water_output", ""):
