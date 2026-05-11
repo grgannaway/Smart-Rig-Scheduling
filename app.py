@@ -45,6 +45,7 @@ from v1_2_rig_scheduler_genetic_algorithm import (  # noqa: E402
     load_base_production,
     load_base_water,
     load_minimum_volumes,
+    load_nonop_months,
     run_single_simulation,
     build_pvi_greedy_order,
     _evaluate_ordering,
@@ -139,6 +140,7 @@ default_paths = {
     "well":       rf"{_NET_BASE}\v2_Schedule_decline_curve_parameters_with_water.csv",
     "base_prod":  rf"{_NET_BASE}\v2_base_production.csv",
     "min_vol":    rf"{_NET_BASE}\v1_minimum_volumes.csv",
+    "nonop":      rf"{_NET_BASE}\v1_d&c_nonop_months.csv",
 }
 
 # ----- 📁 Input CSVs --------------------------------------------------------
@@ -158,6 +160,10 @@ with st.sidebar.expander("📁 Input CSVs", expanded=False):
 
     up_min   = st.file_uploader("Minimum volumes CSV (override)",      type=["csv"], key="up_min")
     min_path = st.text_input("…or minimum volumes path",               value=default_paths["min_vol"])
+
+    up_nonop = st.file_uploader("D&C non-op months CSV (override)",    type=["csv"], key="up_nonop")
+    nonop_path = st.text_input("…or non-op months path (blank = all months allowed)",
+                                value=default_paths["nonop"])
 
 
 # ----- � Output Destination ------------------------------------------------
@@ -396,6 +402,7 @@ if run_clicked:
     well_fp = _save_uploaded(up_well, well_path, tmp_dir)
     base_fp = _save_uploaded(up_base, base_path, tmp_dir)
     min_fp  = _save_uploaded(up_min,  min_path,  tmp_dir)
+    nonop_fp = _save_uploaded(up_nonop, nonop_path, tmp_dir)
 
     if not pad_fp or not well_fp or not base_fp or not min_fp:
         st.error("Pad, well, base-production and minimum-volumes CSVs are all required.")
@@ -474,6 +481,7 @@ if run_clicked:
         well_filepath=well_fp,
         base_production_filepath=base_fp,
         minimum_volume_filepath=min_fp,
+        nonop_months_filepath=nonop_fp if nonop_fp else "",
         # Outputs
         schedule_output=os.path.join(out_dir, "pad_schedule_GA.csv"),
         capex_output=os.path.join(out_dir, "capex_timeline_GA.csv"),
@@ -525,6 +533,7 @@ if run_clicked:
             base_prod  = load_base_production(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
             min_vols   = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days, config.simulation_start_date)
             base_water = load_base_water(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
+            config.nonop_months = load_nonop_months(config.nonop_months_filepath)
             print(f"Loaded {len(pads)} pads, {sum(len(p.wells) for p in pads)} wells assigned.")
 
             progress.progress(0.05, text="Inputs loaded — starting GA")
