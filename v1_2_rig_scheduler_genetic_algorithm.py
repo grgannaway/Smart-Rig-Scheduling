@@ -413,6 +413,10 @@ class SimConfig:
     well_filepath: str = ""
     base_production_filepath: str = ""
     minimum_volume_filepath: str = ""
+    nonop_months_filepath: str = ""   # CSV with month,drill,frac columns (yes/no)
+
+    # Loaded non-op months data (populated by load_nonop_months; not set manually)
+    nonop_months: Dict[str, List[int]] = field(default_factory=lambda: {"drill": [], "frac": []})
 
     # Output files
     schedule_output: str = ""
@@ -538,6 +542,47 @@ def load_minimum_volumes(filepath: str, simulation_days: int,
                                 simulation_start_date=simulation_start_date)
     print(f"Minimum volumes: {arr[0]:,.0f} MCFD, {int(np.sum(arr > 0) / 30)} months")
     return arr
+
+
+def load_nonop_months(filepath: str) -> Dict[str, List[int]]:
+    """Load D&C non-operational months CSV.
+
+    Returns a dict with keys ``'drill'`` and ``'frac'``, each mapping to
+    a list of 1-based month numbers (1=Jan … 12=Dec) where that activity
+    is **not** allowed.  If *filepath* is empty or the file cannot be read,
+    returns empty lists (all months allowed).
+    """
+    result: Dict[str, List[int]] = {"drill": [], "frac": []}
+    if not filepath:
+        return result
+    try:
+        df = pd.read_csv(filepath, encoding="utf-8-sig")
+        df.columns = df.columns.str.strip().str.lower()
+        month_map = {
+            "january": 1, "february": 2, "march": 3, "april": 4,
+            "may": 5, "june": 6, "july": 7, "august": 8,
+            "september": 9, "october": 10, "november": 11, "december": 12,
+        }
+        for _, row in df.iterrows():
+            m = month_map.get(str(row.get("month", "")).strip().lower())
+            if m is None:
+                continue
+            if str(row.get("drill", "yes")).strip().lower() != "yes":
+                result["drill"].append(m)
+            if str(row.get("frac", "yes")).strip().lower() != "yes":
+                result["frac"].append(m)
+        labels = {"drill": "Drill", "frac": "Frac"}
+        for key in ("drill", "frac"):
+            if result[key]:
+                import calendar
+                names = [calendar.month_abbr[m] for m in sorted(result[key])]
+                print(f"{labels[key]} non-op months: {', '.join(names)}")
+            else:
+                print(f"{labels[key]} non-op months: (none — all months allowed)")
+        return result
+    except Exception as e:
+        print(f"Non-op months CSV: failed to load ({e}) — all months allowed.")
+        return result
 
 
 def load_pads_from_csv(filepath: str, sim_start_date: str = "2026-01-01") -> List[WellPad]:
@@ -730,7 +775,8 @@ class OrderedDrillingSimulator:
                  minimum_volumes: Optional[np.ndarray] = None,
                  pad_order: Optional[List[str]] = None,
                  global_overwrites: Optional[Dict] = None,
-                 base_water: Optional[np.ndarray] = None):
+                 base_water: Optional[np.ndarray] = None,
+                 nonop_months: Optional[Dict[str, List[int]]] = None):
         self.pads = deepcopy(pads)
         if pad_order is not None:
             # v1.2: pad_order only contains non-pre-approved pads.
@@ -769,6 +815,12 @@ class OrderedDrillingSimulator:
         # v1.1: warnings emitted during init (e.g. clamped mandatory back-chains)
         self._init_warnings: List[str] = []
 
+        # Non-operational months for drill/frac (empty = all months allowed)
+        _nm = nonop_months if nonop_months is not None else getattr(config, "nonop_months", None)
+        self.nonop_months: Dict[str, List[int]] = _nm if _nm is not None else {"drill": [], "frac": []}
+        # Pre-compute the simulation start date as a pd.Timestamp for day->date mapping
+        self._sim_start_ts = pd.to_datetime(config.simulation_start_date)
+
         self.base_production = base_production if base_production is not None else np.zeros(n)
         self.base_water = base_water if base_water is not None else np.zeros(n)
         self.minimum_volumes = minimum_volumes if minimum_volumes is not None else np.zeros(n)
@@ -804,6 +856,55 @@ class OrderedDrillingSimulator:
         # ---- Pre-reserve mandatory-pad capex (v1.1) -----------------------
         if getattr(self.config, "reserve_mandatory_capex", True):
             self._reserve_mandatory_pads()
+
+    # =====================================================================
+    # NON-OPERATIONAL MONTH CHECKING
+    # =====================================================================
+    def _day_to_date(self, day: int) -> pd.Timestamp:
+        return self._sim_start_ts + pd.Timedelta(days=int(day))
+
+    def _nonop_earliest_start(self, day: int, duration_days: float,
+                               activity: str) -> int:
+        """Return the earliest start day >= *day* such that the entire window
+        ``[start, start + ceil(duration))`` does not overlap any month in which
+        *activity* (``'drill'`` or ``'frac'``) is disallowed.
+
+        If no months are blocked for this activity, returns *day* unchanged.
+        """
+        blocked = self.nonop_months.get(activity, [])
+        if not blocked:
+            return day
+
+        dur = int(np.ceil(duration_days))
+        candidate = day
+        # Safety: never search more than simulation_days ahead
+        max_day = self.config.simulation_days
+        while candidate < max_day:
+            start_date = self._day_to_date(candidate)
+            end_date = self._day_to_date(candidate + dur - 1)  # inclusive last day
+            # Check every month the window spans
+            ok = True
+            cursor = start_date.replace(day=1)
+            while cursor <= end_date:
+                if cursor.month in blocked:
+                    ok = False
+                    break
+                # Advance to first day of next month
+                if cursor.month == 12:
+                    cursor = cursor.replace(year=cursor.year + 1, month=1)
+                else:
+                    cursor = cursor.replace(month=cursor.month + 1)
+            if ok:
+                return candidate
+            # Shift candidate to the first day of the next month after the
+            # offending month.
+            bad_month_date = cursor  # first of the blocked month
+            if bad_month_date.month == 12:
+                next_allowed = bad_month_date.replace(year=bad_month_date.year + 1, month=1)
+            else:
+                next_allowed = bad_month_date.replace(month=bad_month_date.month + 1)
+            candidate = (next_allowed - self._sim_start_ts).days
+        return candidate
 
     # =====================================================================
     # CAPEX BOOKKEEPING (v1.1)
@@ -997,9 +1098,16 @@ class OrderedDrillingSimulator:
             # v1.2: pre-approved pads skip land/permit/pad_con/midstream/overland.
             # mandatory_start_day = drill start day.
             if pad.is_pre_approved:
-                drill_start = mand
+                # Adjust drill start for non-op months: the pad enters
+                # WAITING_DRILL on mandatory_start_day and the drill assignment
+                # block will shift to the first allowed day.
+                drill_start = self._nonop_earliest_start(
+                    max(0, mand), pad.drill_days, "drill") if mand >= 0 else mand
                 drill_end = drill_start + drill_dur
-                frac_start = drill_end
+                # Similarly, frac can't start in a blocked frac month.
+                frac_start_raw = drill_end
+                frac_start = self._nonop_earliest_start(
+                    frac_start_raw, pad.frac_days, "frac") if frac_start_raw >= 0 else frac_start_raw
                 frac_end = frac_start + frac_dur
 
                 # Commit only drill + frac capex.
@@ -1047,9 +1155,10 @@ class OrderedDrillingSimulator:
                 permit_end = permit_start + permit_dur
                 con_start = permit_end
                 con_end = con_start + con_dur
-                drill_start = con_end
+                # Adjust drill/frac starts for non-op months
+                drill_start = self._nonop_earliest_start(con_end, pad.drill_days, "drill")
                 drill_end = drill_start + drill_dur
-                frac_start = drill_end
+                frac_start = self._nonop_earliest_start(drill_end, pad.frac_days, "frac")
                 frac_end = frac_start + frac_dur
                 msg = (f"[WARNING] Pad {pad.name}: mandatory_start_day={mand} not "
                        f"achievable from day 0 (back-chain length={shift + frac_dur} "
@@ -1176,7 +1285,12 @@ class OrderedDrillingSimulator:
     def _rig_reserved_for_mandatory(self, day: int, drill_days: float) -> bool:
         """Return True if starting a non-mandatory pad drilling now would
         leave zero rigs for a pre-approved mandatory pad whose scheduled
-        start falls within the candidate pad's drill window."""
+        start falls within the candidate pad's drill window.
+
+        Non-op month awareness: if the mandatory pad's drill window would
+        itself be blocked by a non-op month, the effective rig-need day
+        is shifted to the earliest allowed start.
+        """
         drill_end = day + int(np.ceil(drill_days))
         for mp in self.pads:
             if not (mp.is_mandatory and mp.is_pre_approved
@@ -1187,7 +1301,10 @@ class OrderedDrillingSimulator:
                 continue  # pre-sim pad, already handled
             # The mandatory pad enters WAITING_DRILL at the end of its
             # mandatory_start_day; it first competes for a rig the next day.
-            rig_need = mp.mandatory_start_day + 1
+            raw_rig_need = mp.mandatory_start_day + 1
+            # Adjust for non-op months — the mandatory pad can't actually
+            # start drilling until the first allowed day.
+            rig_need = self._nonop_earliest_start(raw_rig_need, mp.drill_days, "drill")
             if rig_need <= day or rig_need >= drill_end:
                 continue  # no overlap with candidate's drill window
             # How many rigs will still be busy on that day (excluding the
@@ -1304,6 +1421,9 @@ class OrderedDrillingSimulator:
             for pad in wf:
                 if self.frac_crews_in_use >= self.config.num_frac_crews:
                     break
+                # Non-op month check: skip if frac window would touch a blocked month
+                if self._nonop_earliest_start(day, pad.frac_days, "frac") != day:
+                    continue
                 cost = self._milestone_cost(pad, "frac")
                 if cost > 0 and not self._can_admit(day, pad.frac_days, cost)[0]:
                     continue
@@ -1320,6 +1440,9 @@ class OrderedDrillingSimulator:
             for pad in wd:
                 if self.rigs_in_use >= self.config.num_rigs:
                     break
+                # Non-op month check: skip if drill window would touch a blocked month
+                if self._nonop_earliest_start(day, pad.drill_days, "drill") != day:
+                    continue
                 cost = self._milestone_cost(pad, "drill")
                 if cost > 0 and not self._can_admit(day, pad.drill_days, cost)[0]:
                     continue
@@ -2305,6 +2428,8 @@ def _evaluate_ordering(
     mandatory_violations = 0
     mandatory_slip_details: List[str] = []
     grace = int(getattr(config, "mandatory_pad_grace_days", 0))
+    # Non-op months data for adjusting mandatory slip targets
+    _nonop = getattr(config, "nonop_months", {"drill": [], "frac": []})
     for p in sim.pads:
         if p.is_mandatory and p.mandatory_start_day is not None:
             # v1.2: pads with mandatory_start_day < 0 started before the sim
@@ -2316,10 +2441,17 @@ def _evaluate_ordering(
             if p.is_pre_approved:
                 actual_start = p.drill_start if p.drill_start is not None else 10**9
                 ms_label = "drill_start"
+                # Adjust the mandatory target for non-op months: the earliest
+                # possible drill start may be later than mandatory_start_day
+                # if that day falls in a blocked drill month.
+                effective_target = sim._nonop_earliest_start(
+                    int(p.mandatory_start_day), p.drill_days, "drill"
+                ) if _nonop.get("drill") else int(p.mandatory_start_day)
             else:
                 actual_start = p.land_start if p.land_start is not None else 10**9
                 ms_label = "land_start"
-            if actual_start > p.mandatory_start_day + max(1, grace):
+                effective_target = int(p.mandatory_start_day)
+            if actual_start > effective_target + max(1, grace):
                 mandatory_violations += 1
                 slip = actual_start - p.mandatory_start_day
                 status_str = p.status.name if hasattr(p.status, 'name') else str(p.status)
@@ -3512,6 +3644,7 @@ def main():
         well_filepath=r"\\coterra.com\data\Legacy\Tulsa\Departments\ProductionOperations\GRG\Optimization Engineering\Digital Innovation\Operations Research\MBU\v2_Rig Scheduler\v2_Schedule_decline_curve_parameters_with_water.csv",
         base_production_filepath=r"\\coterra.com\data\Legacy\Tulsa\Departments\ProductionOperations\GRG\Optimization Engineering\Digital Innovation\Operations Research\MBU\v2_Rig Scheduler\v2_base_production.csv",
         minimum_volume_filepath=r"\\coterra.com\data\Legacy\Tulsa\Departments\ProductionOperations\GRG\Optimization Engineering\Digital Innovation\Operations Research\MBU\v2_Rig Scheduler\v1_minimum_volumes.csv",
+        nonop_months_filepath=r"\\coterra.com\data\Legacy\Tulsa\Departments\ProductionOperations\GRG\Optimization Engineering\Digital Innovation\Operations Research\MBU\v2_Rig Scheduler\v1_d&c_nonop_months.csv",
 
         # Output files
         schedule_output=r"C:\Users\GGannaway\Downloads\pad_schedule_GA.csv",
@@ -3574,6 +3707,9 @@ def main():
         config.simulation_days,
         config.simulation_start_date,
     )  # optional
+
+    # Non-operational months for drill/frac
+    config.nonop_months = load_nonop_months(config.nonop_months_filepath)
 
     print(f"\nLoaded: {len(pads)} pads, {sum(len(p.wells) for p in pads)} wells matched.\n")
 
