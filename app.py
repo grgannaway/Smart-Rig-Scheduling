@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 _ENGINE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ENGINE_DIR))
 
-from v1_2_rig_scheduler_genetic_algorithm import (  # noqa: E402
+from v1_3_rig_scheduler_genetic_algorithm import (  # noqa: E402
     SimConfig,
     GAConfig,
     GeneticAlgorithmOptimizer,
@@ -46,6 +46,10 @@ from v1_2_rig_scheduler_genetic_algorithm import (  # noqa: E402
     load_base_water,
     load_minimum_volumes,
     load_nonop_months,
+    load_mandatory_dates,
+    assign_mandatory_dates,
+    load_topside_volumes,
+    load_price_schedule,
     run_single_simulation,
     build_pvi_greedy_order,
     _evaluate_ordering,
@@ -141,6 +145,9 @@ default_paths = {
     "base_prod":  rf"{_NET_BASE}\v2_base_production.csv",
     "min_vol":    rf"{_NET_BASE}\v1_minimum_volumes.csv",
     "nonop":      rf"{_NET_BASE}\v1_d&c_nonop_months.csv",
+    "mandatory":  rf"{_NET_BASE}\v1_mandatory_dates.csv",
+    "topside":    rf"{_NET_BASE}\v1_topside_production.csv",
+    "price":      rf"{_NET_BASE}\v1_gas_prices.csv",
 }
 
 # ----- 📁 Input CSVs --------------------------------------------------------
@@ -164,6 +171,29 @@ with st.sidebar.expander("📁 Input CSVs", expanded=False):
     up_nonop = st.file_uploader("D&C non-op months CSV (override)",    type=["csv"], key="up_nonop")
     nonop_path = st.text_input("…or non-op months path (blank = all months allowed)",
                                 value=default_paths["nonop"])
+
+    st.markdown("---")
+    st.markdown("**v1.3 — New CSV inputs**")
+
+    up_mandatory = st.file_uploader(
+        "Mandatory dates CSV (override)", type=["csv"], key="up_mandatory",
+        help="Columns: pad, drill_limit_date, frac_limit_date, midstream_limit_date, overland_limit_date. "
+             "Dates are 'no later than' limits. Leave blank to skip a milestone.",
+    )
+    mandatory_path = st.text_input("…or mandatory dates CSV path (blank = use pad CSV mandatory flags)",
+                                    value=default_paths["mandatory"])
+
+    up_topside = st.file_uploader(
+        "Topside volumes CSV (override)", type=["csv"], key="up_topside",
+        help="Columns: date, gas_mcfd, water_bwpd. Step-function: each row's values apply until the next row's date.",
+    )
+    topside_path = st.text_input("…or topside volumes CSV path (blank = none)", value=default_paths["topside"])
+
+    up_price = st.file_uploader(
+        "Price schedule CSV (override)", type=["csv"], key="up_price",
+        help="Columns: date, gas_price_per_mcf, shortfall_price_per_mcf. Step-function schedule.",
+    )
+    price_path = st.text_input("…or price schedule CSV path (blank = use defaults below)", value=default_paths["price"])
 
 
 # ----- � Output Destination ------------------------------------------------
@@ -250,17 +280,21 @@ with st.sidebar.expander("💰 Capital & Production Limits", expanded=False):
 
 # ----- 💵 Pricing & Shortfall -----------------------------------------------
 with st.sidebar.expander("💵 Pricing & Shortfall", expanded=False):
-    price_per_mcf  = st.number_input("Gas price ($/MCF, revenue)", 0.0, 25.0, 3.0, step=0.25)
+    st.caption(
+        "These defaults are used when no price schedule CSV is uploaded. "
+        "If a price CSV is provided, these are ignored."
+    )
+    price_per_mcf  = st.number_input("Default gas price ($/MCF)", 0.0, 25.0, 3.0, step=0.25)
     shortfall_tol  = st.number_input("Shortfall tolerance (MCFD)", 0.0, 500_000.0, 10_000.0, step=1_000.0)
     gas_repl_price = st.number_input(
-        "Gas replacement price ($/MCF, shortfall cost)", 0.0, 25.0, 3.0, step=0.25,
+        "Default shortfall price ($/MCF)", 0.0, 25.0, 3.0, step=0.25,
         help="Used in GA fitness: shortfall cost = shortfall_mcfd × days × this price.",
     )
 
 
 # ----- 🗓️ Simulation Horizon ------------------------------------------------
 with st.sidebar.expander("🗓️ Simulation Horizon", expanded=False):
-    sim_days        = st.number_input("Simulation days", 365, 7300, 3650, step=365)
+    sim_days        = st.number_input("Simulation days", 365, 7300, 1825, step=365)
     sim_start_date  = st.text_input("Simulation start date", "2026-06-01")
 
 
@@ -322,6 +356,60 @@ with st.sidebar.expander("💧 Water — Production Deferral", expanded=False):
     )
 
 
+# ----- 💧 Water — Production Cap (v1.3) -------------------------------------
+with st.sidebar.expander("💧 Water — Production Cap (v1.3)", expanded=False):
+    water_cap_bwpd = st.number_input(
+        "Water production cap (BWPD per well, 0 = none)", 0.0, 1e6, 2000.0, step=100.0,
+        help="Hard cap on each well's water production rate. Applied to the decline curve. "
+             "0 = no cap (original behavior).",
+    )
+
+
+# ----- 🏗️ Drop Rig Threshold (v1.3) -----------------------------------------
+with st.sidebar.expander("🏗️ Drop Rig Threshold (v1.3)", expanded=False):
+    st.caption(
+        "When a rig finishes drilling and no pad is ready within the gap window, "
+        "the rig is 'dropped' (released). Picking it back up later incurs a delay."
+    )
+    drop_rig_gap_days = st.number_input(
+        "Drop rig gap (days)", 0, 365, 5,
+        help="If a rig is idle for more than this many days with no pad ready, it is dropped.",
+    )
+    drop_rig_pickup_delay = st.number_input(
+        "Rig pickup delay (days)", 0, 365, 60,
+        help="Days of delay to re-mobilize a dropped rig before it can drill the next pad.",
+    )
+
+
+# ----- 🔧 Frac Operations (v1.3) --------------------------------------------
+with st.sidebar.expander("🔧 Frac Operations (v1.3)", expanded=False):
+    st.caption(
+        "Controls the gap between completing drilling and starting frac, "
+        "and the behavior of continuous vs non-continuous frac crews."
+    )
+    frac_gap_noncontiguous = st.number_input(
+        "Non-contiguous gap (days)", 0, 365, 5,
+        help="Minimum gap between frac jobs for a non-continuous crew.",
+    )
+    frac_post_drill_delay = st.number_input(
+        "Post-drill delay — continuous (days)", 0, 365, 21,
+        help="Days after drill completion before frac can start (continuous crew).",
+    )
+    frac_noncontiguous_delay = st.number_input(
+        "Post-drill delay — non-continuous (days)", 0, 365, 50,
+        help="Days after drill completion before frac can start (non-continuous crew).",
+    )
+
+
+# ----- 📈 Topside Production (v1.3) -----------------------------------------
+with st.sidebar.expander("📈 Topside Production (v1.3)", expanded=False):
+    topside_pct_adder = st.number_input(
+        "Topside production % adder", -100.0, 1000.0, 0.0, step=0.5,
+        help="Percentage uplift applied to base + new-well production volumes "
+             "(gas and water). E.g. 5.0 = +5%. Does NOT apply to topside CSV volumes.",
+    )
+
+
 # ----- 🧬 GA — Population & Operators ---------------------------------------
 with st.sidebar.expander("🧬 GA — Population & Operators", expanded=False):
     pop_size       = st.number_input("Population size", 4, 1000, 60)
@@ -341,7 +429,7 @@ with st.sidebar.expander("🧬 GA — Population & Operators", expanded=False):
 with st.sidebar.expander("🎯 GA — Objective & Penalties", expanded=False):
     discount_rate = st.number_input("Discount rate (annual)", 0.0, 0.50, 0.10, step=0.01)
     pvi_penalty   = st.number_input(
-        "PVI delay penalty constant", 0.0, 1e10, 100_000_000.0, step=1e7, format="%.0f",
+        "PVI delay penalty constant", 0.0, 1e10, 0.0, step=1e7, format="%.0f",
         help="penalty_$ = pad.pvi × this constant × (1 − discount_factor(first_production_day)).",
     )
 
@@ -403,6 +491,9 @@ if run_clicked:
     base_fp = _save_uploaded(up_base, base_path, tmp_dir)
     min_fp  = _save_uploaded(up_min,  min_path,  tmp_dir)
     nonop_fp = _save_uploaded(up_nonop, nonop_path, tmp_dir)
+    mandatory_fp = _save_uploaded(up_mandatory, mandatory_path, tmp_dir)
+    topside_fp   = _save_uploaded(up_topside,   topside_path,   tmp_dir)
+    price_fp     = _save_uploaded(up_price,     price_path,     tmp_dir)
 
     if not pad_fp or not well_fp or not base_fp or not min_fp:
         st.error("Pad, well, base-production and minimum-volumes CSVs are all required.")
@@ -449,6 +540,16 @@ if run_clicked:
         # Pricing & shortfall
         commodity_price_per_mcf=float(price_per_mcf),
         shortfall_tolerance_mcfd=float(shortfall_tol),
+        # v1.3 new fields
+        water_production_cap_bwpd=float(water_cap_bwpd),
+        drop_rig_gap_days=int(drop_rig_gap_days),
+        drop_rig_pickup_delay_days=int(drop_rig_pickup_delay),
+        frac_gap_noncontiguous_days=int(frac_gap_noncontiguous),
+        frac_post_drill_delay_days=int(frac_post_drill_delay),
+        frac_noncontiguous_delay_days=int(frac_noncontiguous_delay),
+        topside_production_pct_adder=float(topside_pct_adder),
+        default_gas_price_per_mcf=float(price_per_mcf),
+        default_shortfall_price_per_mcf=float(gas_repl_price),
         # Sim
         simulation_days=int(sim_days),
         simulation_start_date=sim_start_date,
@@ -534,6 +635,29 @@ if run_clicked:
             min_vols   = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days, config.simulation_start_date)
             base_water = load_base_water(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
             config.nonop_months = load_nonop_months(config.nonop_months_filepath)
+
+            # v1.3 — mandatory dates CSV
+            if mandatory_fp:
+                mand_dates = load_mandatory_dates(mandatory_fp, config.simulation_start_date)
+                assign_mandatory_dates(pads, mand_dates)
+                print(f"  Loaded mandatory dates for {len(mand_dates)} pads.")
+
+            # v1.3 — topside volumes CSV
+            topside_gas = None
+            topside_water = None
+            if topside_fp:
+                topside_gas, topside_water = load_topside_volumes(
+                    topside_fp, config.simulation_days, config.simulation_start_date)
+                print(f"  Loaded topside volumes from {topside_fp}.")
+
+            # v1.3 — price schedule CSV
+            gas_price_schedule = None
+            shortfall_price_schedule = None
+            if price_fp:
+                gas_price_schedule, shortfall_price_schedule = load_price_schedule(
+                    price_fp, config.simulation_days, config.simulation_start_date)
+                print(f"  Loaded price schedule from {price_fp}.")
+
             print(f"Loaded {len(pads)} pads, {sum(len(p.wells) for p in pads)} wells assigned.")
 
             progress.progress(0.05, text="Inputs loaded — starting GA")
@@ -545,6 +669,10 @@ if run_clicked:
                 minimum_volumes=min_vols,
                 template_pads=pads,
                 base_water=base_water,
+                topside_gas=topside_gas,
+                topside_water=topside_water,
+                gas_price_schedule=gas_price_schedule,
+                shortfall_price_schedule=shortfall_price_schedule,
             )
             best_order, best_fb = optimizer.run()
 
@@ -556,11 +684,17 @@ if run_clicked:
                 pad_order=bench_order, config=config, ga_config=ga_config,
                 base_production=base_prod, minimum_volumes=min_vols,
                 template_pads=pads, base_water=base_water,
+                topside_gas=topside_gas, topside_water=topside_water,
+                gas_price_schedule=gas_price_schedule,
+                shortfall_price_schedule=shortfall_price_schedule,
             )
             bench_result = run_single_simulation(
                 config=config, base_production=base_prod, minimum_volumes=min_vols,
                 pad_order=bench_order, label="PVI_GREEDY", template_pads=pads,
                 base_water=base_water,
+                topside_gas=topside_gas, topside_water=topside_water,
+                gas_price_schedule=gas_price_schedule,
+                shortfall_price_schedule=shortfall_price_schedule,
             )
             bench_monthly = bench_result["monthly"]
 
@@ -569,15 +703,21 @@ if run_clicked:
                 config=config, base_production=base_prod, minimum_volumes=min_vols,
                 pad_order=best_order, label="GA_BEST", template_pads=pads,
                 base_water=base_water,
+                topside_gas=topside_gas, topside_water=topside_water,
+                gas_price_schedule=gas_price_schedule,
+                shortfall_price_schedule=shortfall_price_schedule,
+                enable_event_log=True,
             )
             final_sim     = final_result["sim"]
             final_monthly = final_result["monthly"]
 
             # Augment monthly DataFrames with FCF NET of water + gas-shortfall costs
             final_monthly = _add_net_fcf_columns(final_monthly, config,
-                                                  ga_config.gas_replacement_price_per_mcf)
+                                                  ga_config.gas_replacement_price_per_mcf,
+                                                  shortfall_price_schedule=shortfall_price_schedule)
             bench_monthly = _add_net_fcf_columns(bench_monthly, config,
-                                                  ga_config.gas_replacement_price_per_mcf)
+                                                  ga_config.gas_replacement_price_per_mcf,
+                                                  shortfall_price_schedule=shortfall_price_schedule)
 
             progress.progress(0.95, text="Writing CSVs")
 
@@ -591,7 +731,10 @@ if run_clicked:
             def _row(p, label):
                 return {
                     "run": label, "pad": p.name, "is_mandatory": p.is_mandatory,
-                    "mandatory_start_day": p.mandatory_start_day,
+                    "mandatory_drill_day": p.mandatory_drill_day,
+                    "mandatory_frac_day": p.mandatory_frac_day,
+                    "mandatory_midstream_day": p.mandatory_midstream_day,
+                    "mandatory_overland_day": p.mandatory_overland_day,
                     "land_start": p.land_start, "land_end": p.land_end,
                     "permit_start": p.permit_start, "permit_end": p.permit_end,
                     "pad_con_start": p.pad_con_start, "pad_con_end": p.pad_con_end,
@@ -614,9 +757,13 @@ if run_clicked:
                     config=config, base_production=base_prod, minimum_volumes=min_vols,
                     pad_order=gen_order, label=f"gen_{h['generation']}_best",
                     template_pads=pads, base_water=base_water,
+                    topside_gas=topside_gas, topside_water=topside_water,
+                    gas_price_schedule=gas_price_schedule,
+                    shortfall_price_schedule=shortfall_price_schedule,
                 )
                 gen_monthly = _add_net_fcf_columns(
-                    gen_res["monthly"], config, ga_config.gas_replacement_price_per_mcf
+                    gen_res["monthly"], config, ga_config.gas_replacement_price_per_mcf,
+                    shortfall_price_schedule=shortfall_price_schedule,
                 )
                 per_gen[int(h["generation"])] = {
                     "order":   list(gen_order),
@@ -633,7 +780,10 @@ if run_clicked:
 
             # Also write a dates version of the schedule
             day_cols = [
-                "mandatory_start_day",
+                "mandatory_drill_day",
+                "mandatory_frac_day",
+                "mandatory_midstream_day",
+                "mandatory_overland_day",
                 "land_start", "land_end",
                 "permit_start", "permit_end",
                 "pad_con_start", "pad_con_end",
@@ -654,6 +804,12 @@ if run_clicked:
             base, ext = os.path.splitext(config.schedule_output)
             dates_path = f"{base}_dates{ext}"
             dates_df.to_csv(dates_path, index=False)
+
+            # v1.3: Event log CSV
+            event_log_df = final_sim.get_event_log_df()
+            event_log_path = os.path.join(out_dir, "event_log_GA.csv")
+            if not event_log_df.empty:
+                event_log_df.to_csv(event_log_path, index=False)
 
             # Daily water mass balance
             n_days = len(final_sim.daily_water_produced_bbl)
@@ -714,6 +870,8 @@ if run_clicked:
                 n_months = n_days_sim // 30 + 1
                 r = ga_config.discount_rate_annual
                 price = config.commodity_price_per_mcf
+                # v1.3: use price schedule if available
+                _gas_ps = gas_price_schedule
                 days_in_month = 30
                 df_month = (1.0 + r) ** (-np.arange(n_months) / 12.0)
 
@@ -768,7 +926,14 @@ if run_clicked:
                             break
                         prod_mcfd = p.production_at_day(sample_day)
                         water_bwpd = p.water_production_at_day(sample_day)
-                        revenue_mm = prod_mcfd * days_in_month * price / 1e6
+                        # v1.3: month-average price from schedule if available
+                        if _gas_ps is not None:
+                            month_start = mi * 30
+                            month_end = min(month_start + 30, len(_gas_ps))
+                            month_price = float(np.mean(_gas_ps[month_start:month_end])) if month_end > month_start else price
+                        else:
+                            month_price = price
+                        revenue_mm = prod_mcfd * days_in_month * month_price / 1e6
                         is_producing = (p.first_production_day is not None
                                         and sample_day >= p.first_production_day)
                         opex_mm = (p.annual_opex_mm / 12.0) if is_producing else 0.0
@@ -879,6 +1044,10 @@ if run_clicked:
         "per_gen":        per_gen,
         "elapsed":        elapsed,
         "base_water":     base_water,
+        "topside_gas":    topside_gas,
+        "topside_water":  topside_water,
+        "gas_price_schedule":      gas_price_schedule,
+        "shortfall_price_schedule": shortfall_price_schedule,
     }
 
 
@@ -1094,13 +1263,20 @@ if "last_run" in st.session_state:
 
         if not best_fb.feasible:
             st.error(f"GA solution infeasible: {best_fb.invalid_reason}")
+        if best_fb.mandatory_date_conflicts > 0:
+            st.warning(
+                f"⚠️ **{best_fb.mandatory_date_conflicts} mandatory date conflict(s)** — "
+                f"some mandatory dates are physically impossible given milestone durations. "
+                f"Details: {best_fb.mandatory_date_conflict_details}"
+            )
 
         st.subheader("GA vs PVI-greedy benchmark")
         cmp_df = pd.DataFrame({
             "Metric": [
                 "NPV score ($MM)", "PV FCF ($MM)", "PV Water ($MM)",
                 "PV Shortfall ($MM)", "PV PVI delay ($MM)", "Total FCF undisc ($MM)",
-                "Capex overage ($MM)", "Mandatory violations", "Water unhandled (Mbbl)",
+                "Capex overage ($MM)", "Mandatory violations", "Mandatory date conflicts",
+                "Water unhandled (Mbbl)",
                 "Mandatory capex overage ($MM)", "Pads ending blocked",
                 "Feasible",
             ],
@@ -1108,7 +1284,8 @@ if "last_run" in st.session_state:
                 best_fb.score, best_fb.pv_fcf_mm, best_fb.pv_water_cost_mm,
                 best_fb.pv_shortfall_cost_mm, best_fb.pv_pvi_delay_penalty_mm,
                 best_fb.total_fcf_mm, best_fb.capex_overage_mm,
-                best_fb.mandatory_violations, best_fb.water_unhandled_total_bbl / 1e3,
+                best_fb.mandatory_violations, best_fb.mandatory_date_conflicts,
+                best_fb.water_unhandled_total_bbl / 1e3,
                 best_fb.mandatory_capex_overage_mm, best_fb.pads_capex_blocked,
                 feas_tag,
             ],
@@ -1116,7 +1293,8 @@ if "last_run" in st.session_state:
                 bench_fb.score, bench_fb.pv_fcf_mm, bench_fb.pv_water_cost_mm,
                 bench_fb.pv_shortfall_cost_mm, bench_fb.pv_pvi_delay_penalty_mm,
                 bench_fb.total_fcf_mm, bench_fb.capex_overage_mm,
-                bench_fb.mandatory_violations, bench_fb.water_unhandled_total_bbl / 1e3,
+                bench_fb.mandatory_violations, bench_fb.mandatory_date_conflicts,
+                bench_fb.water_unhandled_total_bbl / 1e3,
                 bench_fb.mandatory_capex_overage_mm, bench_fb.pads_capex_blocked,
                 bench_tag,
             ],
@@ -1155,6 +1333,7 @@ if "last_run" in st.session_state:
             ("GA convergence history",         os.path.join(config.plot_output_folder, "ga_convergence.csv")),
             ("Per-pad monthly FCF/production", os.path.join(config.plot_output_folder, "pad_month_fcf_production.csv")),
             ("Per-pad summary (PVI vs FCF)",   os.path.join(config.plot_output_folder, "pad_summary_pvi_vs_fcf.csv")),
+            ("Event log (scheduling decisions)", os.path.join(out_dir, "event_log_GA.csv")),
         ]
         for label, path in files:
             if path and os.path.exists(path):
@@ -1173,6 +1352,28 @@ if "last_run" in st.session_state:
                 st.subheader("Diagnostic plots")
                 for p in png_files:
                     st.image(os.path.join(plots_dir, p), caption=p, use_container_width=True)
+
+        # v1.3: Event log viewer
+        event_log_path = os.path.join(out_dir, "event_log_GA.csv")
+        if os.path.exists(event_log_path):
+            with st.expander("📋 Event Log — Scheduling Decisions", expanded=False):
+                st.caption(
+                    "Every scheduling decision the simulator made: why pads were "
+                    "delayed, which rig/crew was assigned, when rigs were dropped, etc. "
+                    "Filter by pad name or event type to trace a specific pad's history."
+                )
+                elog = pd.read_csv(event_log_path)
+                # Filters
+                fc1, fc2 = st.columns(2)
+                pad_filter = fc1.text_input("Filter by pad name (contains)", key="elog_pad_filter")
+                event_types = ["(all)"] + sorted(elog["event"].unique().tolist())
+                event_filter = fc2.selectbox("Filter by event type", event_types, key="elog_event_filter")
+                filtered = elog
+                if pad_filter:
+                    filtered = filtered[filtered["pad"].str.contains(pad_filter, case=False, na=False)]
+                if event_filter != "(all)":
+                    filtered = filtered[filtered["event"] == event_filter]
+                st.dataframe(filtered, use_container_width=True, hide_index=True, height=400)
 
     # -------------------------------------------------------------------------
     # TAB 2 — Explore individual generations (best parent of each generation)
