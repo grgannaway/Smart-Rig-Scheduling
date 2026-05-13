@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Streamlit GUI for the Genetic Algorithm Rig Scheduler.
+Streamlit GUI for the Genetic Algorithm Rig Scheduler (v1.4).
 
 Run locally:
     streamlit run app.py
 
-Imports the engine directly from the parent project folder
-(`v1_rig_scheduler_genetic_algorithm.py`), so this file is a thin UI shim.
+v1.4 changes vs v1.3:
+  - Capital, production, OL/MS, and FCF constraints are now loaded from a CSV
+    (one row per calendar year) instead of manual scalar inputs.
+  - Production ceiling removed; replaced with production minimum floor.
+  - FCF minimum floor added.
+  - CAGR fields removed.
 """
 
 from __future__ import annotations
@@ -30,12 +34,12 @@ import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------------------------
 # Make the GA engine importable.  The engine lives one folder up from this
-# file as `v1_rig_scheduler_genetic_algorithm.py`.
+# file as `v1_4_rig_scheduler_genetic_algorithm.py`.
 # ---------------------------------------------------------------------------
 _ENGINE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ENGINE_DIR))
 
-from v1_3_rig_scheduler_genetic_algorithm import (  # noqa: E402
+from v1_4_rig_scheduler_genetic_algorithm import (  # noqa: E402
     SimConfig,
     GAConfig,
     GeneticAlgorithmOptimizer,
@@ -50,6 +54,7 @@ from v1_3_rig_scheduler_genetic_algorithm import (  # noqa: E402
     assign_mandatory_dates,
     load_topside_volumes,
     load_price_schedule,
+    load_annual_constraints,
     run_single_simulation,
     build_pvi_greedy_order,
     _evaluate_ordering,
@@ -64,15 +69,16 @@ from v1_3_rig_scheduler_genetic_algorithm import (  # noqa: E402
 # Streamlit page
 # =============================================================================
 st.set_page_config(
-    page_title="Rig Scheduler GA",
+    page_title="Rig Scheduler GA v1.4",
     page_icon="🧬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-st.title("🧬 Rig Scheduler — Genetic Algorithm")
+st.title("🧬 Rig Scheduler — Genetic Algorithm (v1.4)")
 st.caption(
     "GA over pad orderings; daily simulator enforces crew/capex/water "
-    "constraints; fitness = PV(FCF) − PV(water) − PV(shortfall) − PV(PVI delay)."
+    "constraints; fitness = PV(FCF) − PV(water) − PV(shortfall) − PV(PVI delay). "
+    "v1.4: CSV-driven annual constraints for capital, production, OL/MS, and FCF."
 )
 
 
@@ -140,14 +146,15 @@ _NET_BASE = (
     r"\v2_Rig Scheduler"
 )
 default_paths = {
-    "pad":        rf"{_NET_BASE}\v2_Schedule.csv",
-    "well":       rf"{_NET_BASE}\v2_Schedule_decline_curve_parameters_with_water.csv",
-    "base_prod":  rf"{_NET_BASE}\v2_base_production.csv",
-    "min_vol":    rf"{_NET_BASE}\v1_minimum_volumes.csv",
-    "nonop":      rf"{_NET_BASE}\v1_d&c_nonop_months.csv",
-    "mandatory":  rf"{_NET_BASE}\v1_mandatory_dates.csv",
-    "topside":    rf"{_NET_BASE}\v1_topside_production.csv",
-    "price":      rf"{_NET_BASE}\v1_gas_prices.csv",
+    "pad":          rf"{_NET_BASE}\v2_Schedule.csv",
+    "well":         rf"{_NET_BASE}\v2_Schedule_decline_curve_parameters_with_water.csv",
+    "base_prod":    rf"{_NET_BASE}\v2_base_production.csv",
+    "min_vol":      rf"{_NET_BASE}\v1_minimum_volumes.csv",
+    "nonop":        rf"{_NET_BASE}\v1_d&c_nonop_months.csv",
+    "mandatory":    rf"{_NET_BASE}\v1_mandatory_dates.csv",
+    "topside":      rf"{_NET_BASE}\v1_topside_production.csv",
+    "price":        rf"{_NET_BASE}\v1_gas_prices.csv",
+    "constraints":  rf"{_NET_BASE}\v1_constraint_targets.csv",
 }
 
 # ----- 📁 Input CSVs --------------------------------------------------------
@@ -195,10 +202,24 @@ with st.sidebar.expander("📁 Input CSVs", expanded=False):
     )
     price_path = st.text_input("…or price schedule CSV path (blank = use defaults below)", value=default_paths["price"])
 
+    st.markdown("---")
+    st.markdown("**v1.4 — Annual Constraints CSV**")
+    up_constraints = st.file_uploader(
+        "Annual constraints CSV (override)", type=["csv"], key="up_constraints",
+        help="Columns: year, gross production rate (mcfd), total net capital $, "
+             "overland/midstream budget $, free cashflow $. "
+             "Blank cells = unconstrained for that year/metric. "
+             "Values can be in raw $ (auto-converted to $MM if > 10,000).",
+    )
+    constraints_path = st.text_input(
+        "…or constraints CSV path (blank = unconstrained)",
+        value=default_paths["constraints"],
+        help="CSV with annual targets: capital (max), production (min floor), "
+             "OL/MS (max sub-budget), FCF (min floor). One row per calendar year.",
+    )
 
-# ----- � Output Destination ------------------------------------------------
-# Default to the same network share as the inputs, under a `GA_Outputs` subfolder.
-# Each run is written into a timestamped subfolder so prior runs are preserved.
+
+# ----- 📤 Output Destination ------------------------------------------------
 default_output_root = rf"{_NET_BASE}\GA_Outputs"
 with st.sidebar.expander("📤 Output Destination", expanded=False):
     st.caption(
@@ -224,7 +245,7 @@ with st.sidebar.expander("📤 Output Destination", expanded=False):
         st.caption(f"This run will write to: `{output_root}\\`")
 
 
-# ----- �👷 Crews & Resources -------------------------------------------------
+# ----- 👷 Crews & Resources -------------------------------------------------
 with st.sidebar.expander("👷 Crews & Resources", expanded=False):
     c1, c2 = st.columns(2)
     num_rigs      = c1.number_input("Rigs", 1, 50, 2)
@@ -234,31 +255,13 @@ with st.sidebar.expander("👷 Crews & Resources", expanded=False):
     num_construct = c1.number_input("Construction crews", 1, 50, 3)
 
 
-# ----- 💰 Capital & Production Limits ---------------------------------------
-with st.sidebar.expander("💰 Capital & Production Limits", expanded=False):
-    st.markdown("**Annual capex (base year)**")
-    annual_capex     = st.number_input("Annual capex limit ($MM)", 0.0, 5000.0, 350.0, step=25.0)
-    capex_tol        = st.number_input("Capex tolerance ($MM)", 0.0, 500.0, 10.0, step=5.0)
-    year_1_override  = st.number_input(
-        "Year 1 capex limit override ($MM, 0 = use formula)", 0.0, 5000.0, 0.0, step=25.0,
-        help="Explicit capex ceiling for year 1 (sim start \u2192 12/31). "
-             "0 = use the standard annual limit / CAGR formula. "
-             "Useful when pre-approved pads drive a different year-1 capital profile.",
+# ----- 💰 Capital & Constraints (v1.4 — CSV-driven) -------------------------
+with st.sidebar.expander("💰 Capital & Constraints (v1.4)", expanded=False):
+    st.caption(
+        "Annual constraints (capex max, OL/MS sub-budget, production min, FCF min) "
+        "are now loaded from the **Annual Constraints CSV** in the Input CSVs section. "
+        "Years beyond the CSV are unconstrained."
     )
-    capex_cagr_pct   = st.number_input("Capex CAGR (% / yr)", -50.0, 50.0, 0.0, step=0.5)
-    capex_cagr_years = st.number_input("Capex CAGR years", 0, 50, 0)
-
-    st.markdown("**Overland / Midstream sub-budget**")
-    ol_ms_budget     = st.number_input("OL/MS sub-budget ($MM/yr, 0 = no sub-cap)", 0.0, 1000.0, 25.0, step=5.0)
-    ol_ms_cagr_pct   = st.number_input("OL/MS CAGR (% / yr)", -50.0, 50.0, 0.0, step=0.5)
-    ol_ms_cagr_years = st.number_input("OL/MS CAGR years", 0, 50, 0)
-
-    st.markdown("**Production ceiling**")
-    prod_ceiling        = st.number_input(
-        "Production ceiling (MCFD avg/yr, 0 = none)", 0.0, 50_000_000.0, 5_000_000.0, step=100_000.0
-    )
-    production_cagr_pct   = st.number_input("Production CAGR (% / yr)", -50.0, 50.0, 0.0, step=0.5)
-    production_cagr_years = st.number_input("Production CAGR years", 0, 50, 0)
 
     st.markdown("**Capex disbursement (v1.1)**")
     capex_disbursement = st.selectbox(
@@ -436,12 +439,15 @@ with st.sidebar.expander("🎯 GA — Objective & Penalties", expanded=False):
 
 # ----- 🚦 GA — Hard Constraints ---------------------------------------------
 with st.sidebar.expander("🚦 GA — Hard Constraints", expanded=False):
-    enf_capex   = st.checkbox("Enforce capex budget",      True)
-    enf_ceiling = st.checkbox("Enforce production ceiling", True)
-    enf_mand    = st.checkbox("Enforce mandatory pads",     True)
-    enf_minvol  = st.checkbox("Enforce minimum volumes",    False)
-    enf_water   = st.checkbox("Enforce water takeaway",     True)
-    water_tol   = st.number_input(
+    enf_capex    = st.checkbox("Enforce capex budget (CSV max)",         True)
+    enf_prod_min = st.checkbox("Enforce production minimum (CSV floor)", True,
+                               help="If checked, any year below the CSV production minimum is infeasible.")
+    enf_fcf_min  = st.checkbox("Enforce FCF minimum (CSV floor)",        True,
+                               help="If checked, any year below the CSV FCF minimum is infeasible.")
+    enf_mand     = st.checkbox("Enforce mandatory pads",                 True)
+    enf_minvol   = st.checkbox("Enforce minimum volumes",                False)
+    enf_water    = st.checkbox("Enforce water takeaway",                 True)
+    water_tol    = st.number_input(
         "Water unhandled tolerance (bbl)", 0.0, 1e9, 0.0, step=1000.0,
         help="Total bbl of unhandled water allowed across the full simulation.",
     )
@@ -494,13 +500,13 @@ if run_clicked:
     mandatory_fp = _save_uploaded(up_mandatory, mandatory_path, tmp_dir)
     topside_fp   = _save_uploaded(up_topside,   topside_path,   tmp_dir)
     price_fp     = _save_uploaded(up_price,     price_path,     tmp_dir)
+    constraints_fp = _save_uploaded(up_constraints, constraints_path, tmp_dir)
 
     if not pad_fp or not well_fp or not base_fp or not min_fp:
         st.error("Pad, well, base-production and minimum-volumes CSVs are all required.")
         st.stop()
 
-    # ---- Output paths — write into the user-selected output root (Settings tab),
-    #      optionally under a per-run timestamped subfolder.
+    # ---- Output paths
     out_root = (output_root or "").strip()
     if not out_root:
         st.error("Output root folder is empty — set one in the '📤 Output Destination' section.")
@@ -523,20 +529,8 @@ if run_clicked:
         num_land_crews=int(num_land),
         num_permit_crews=int(num_permit),
         num_construction_crews=int(num_construct),
-        # Capital
-        annual_capex_limit_mm=float(annual_capex),
-        capex_tolerance_mm=float(capex_tol),
-        year_1_capex_limit_mm=float(year_1_override) if year_1_override > 0 else None,
-        capex_cagr_pct=float(capex_cagr_pct),
-        capex_cagr_years=int(capex_cagr_years),
-        # OL/MS sub-budget
-        overland_midstream_budget_mm=float(ol_ms_budget),
-        ol_ms_cagr_pct=float(ol_ms_cagr_pct),
-        ol_ms_cagr_years=int(ol_ms_cagr_years),
-        # Production ceiling
-        production_ceiling_mcfd=float(prod_ceiling),
-        production_cagr_pct=float(production_cagr_pct),
-        production_cagr_years=int(production_cagr_years),
+        # v1.4: annual constraints loaded below from CSV
+        annual_constraints_filepath=constraints_fp if constraints_fp else "",
         # Pricing & shortfall
         commodity_price_per_mcf=float(price_per_mcf),
         shortfall_tolerance_mcfd=float(shortfall_tol),
@@ -605,7 +599,8 @@ if run_clicked:
         discount_rate_annual=float(discount_rate),
         gas_replacement_price_per_mcf=float(gas_repl_price),
         enforce_capex_budget=enf_capex,
-        enforce_production_ceiling=enf_ceiling,
+        enforce_production_minimum=enf_prod_min,
+        enforce_fcf_minimum=enf_fcf_min,
         enforce_mandatory_pads=enf_mand,
         enforce_minimum_volumes=enf_minvol,
         enforce_water_takeaway=enf_water,
@@ -635,6 +630,15 @@ if run_clicked:
             min_vols   = load_minimum_volumes(config.minimum_volume_filepath, config.simulation_days, config.simulation_start_date)
             base_water = load_base_water(config.base_production_filepath, config.simulation_days, config.simulation_start_date)
             config.nonop_months = load_nonop_months(config.nonop_months_filepath)
+
+            # v1.4 — load annual constraints CSV
+            if config.annual_constraints_filepath:
+                config.annual_constraints = load_annual_constraints(
+                    config.annual_constraints_filepath, config.simulation_start_date)
+                n_years = len(config.annual_constraints)
+                print(f"  Annual constraints: loaded {n_years} year(s) from CSV.")
+            else:
+                print("  Annual constraints: none (all years unconstrained).")
 
             # v1.3 — mandatory dates CSV
             if mandatory_fp:
@@ -678,7 +682,7 @@ if run_clicked:
 
             progress.progress(0.85, text="GA finished — running PVI-greedy benchmark + final sim")
 
-            # PVI-greedy benchmark (informational + needed for plot baselines)
+            # PVI-greedy benchmark
             bench_order = build_pvi_greedy_order(pads)
             bench_fb = _evaluate_ordering(
                 pad_order=bench_order, config=config, ga_config=ga_config,
@@ -721,13 +725,12 @@ if run_clicked:
 
             progress.progress(0.95, text="Writing CSVs")
 
-            # CSV outputs (replicate the engine's writer behavior for the GUI)
+            # CSV outputs
             final_monthly.to_csv(config.monthly_output, index=False)
 
             # Pad schedule across every generation's best + final.
-            # Also capture each generation-best sim for the "Explore Generations" tab.
             sched_rows = []
-            per_gen: dict = {}  # generation -> {order, sim, monthly, score}
+            per_gen: dict = {}
             def _row(p, label):
                 return {
                     "run": label, "pad": p.name, "is_mandatory": p.is_mandatory,
@@ -778,7 +781,7 @@ if run_clicked:
             sched_df = pd.DataFrame(sched_rows)
             sched_df.to_csv(config.schedule_output, index=False)
 
-            # Also write a dates version of the schedule
+            # Dates version of the schedule
             day_cols = [
                 "mandatory_drill_day",
                 "mandatory_frac_day",
@@ -858,19 +861,18 @@ if run_clicked:
 
             history_df = optimizer.history_df()
 
-            # ---- GA convergence CSV
+            # GA convergence CSV
             if not history_df.empty:
                 hist_path = os.path.join(config.plot_output_folder, "ga_convergence.csv")
                 history_df.to_csv(hist_path, index=False)
 
-            # ---- Per-pad-by-month FCF & production breakdown + per-pad summary
+            # Per-pad-by-month FCF & production breakdown + per-pad summary
             try:
                 from typing import Dict as _Dict
                 n_days_sim = config.simulation_days
                 n_months = n_days_sim // 30 + 1
                 r = ga_config.discount_rate_annual
                 price = config.commodity_price_per_mcf
-                # v1.3: use price schedule if available
                 _gas_ps = gas_price_schedule
                 days_in_month = 30
                 df_month = (1.0 + r) ** (-np.arange(n_months) / 12.0)
@@ -926,7 +928,6 @@ if run_clicked:
                             break
                         prod_mcfd = p.production_at_day(sample_day)
                         water_bwpd = p.water_production_at_day(sample_day)
-                        # v1.3: month-average price from schedule if available
                         if _gas_ps is not None:
                             month_start = mi * 30
                             month_end = min(month_start + 30, len(_gas_ps))
@@ -989,7 +990,7 @@ if run_clicked:
             except Exception as ex:  # noqa: BLE001
                 print(f"  (per-pad FCF CSV error: {ex})")
 
-            # ---- Render the full engine plot dashboard into plot_output_folder
+            # Render engine plots
             try:
                 make_diagnostic_plots(
                     optimizer=optimizer,
@@ -1026,8 +1027,6 @@ if run_clicked:
 
     elapsed = time.time() - t_start
 
-    # Stash everything to session_state so the explorer tab survives Streamlit
-    # widget reruns without re-running the GA.
     st.session_state["last_run"] = {
         "out_dir":        out_dir,
         "config":         config,
@@ -1176,11 +1175,8 @@ def _render_monthly_fcf(monthly_df, label_prefix=""):
 
 
 def _render_cumulative_fcf(monthly_df, label_prefix="", baseline_df=None, baseline_label="PVI baseline"):
-    """Cumulative FCF line chart — net of capital, opex, water cost, and
-    gas-shortfall penalty.  PVI delay penalty is excluded (fitness-only)."""
     if monthly_df is None or monthly_df.empty:
         return
-    # Prefer the NET column (includes water + shortfall deductions)
     cum_col = ("cumulative_fcf_net_mm" if "cumulative_fcf_net_mm" in monthly_df.columns
                else ("cumulative_fcf_mm" if "cumulative_fcf_mm" in monthly_df.columns else None))
     if cum_col is None:
@@ -1232,10 +1228,6 @@ if "last_run" in st.session_state:
 
     st.success(f"GA finished in {elapsed:,.1f}s — output folder: `{out_dir}`")
 
-    # NOTE: Don't use st.tabs() here — it resets to the first tab on every script
-    # rerun (which Streamlit triggers whenever any widget value changes), so any
-    # selection on the Explore tab would bounce the user back to the main view.
-    # A st.radio with a stable `key` persists in session_state and survives reruns.
     TAB_MAIN    = "📈 Best / Final solution"
     TAB_EXPLORE = "🔬 Explore generations"
     active_tab = st.radio(
@@ -1247,7 +1239,7 @@ if "last_run" in st.session_state:
     )
 
     # -------------------------------------------------------------------------
-    # TAB 1 — Best / Final solution (the main view)
+    # TAB 1 — Best / Final solution
     # -------------------------------------------------------------------------
     if active_tab == TAB_MAIN:
         feas_tag = "✅ feasible" if best_fb.feasible else "❌ infeasible"
@@ -1275,7 +1267,9 @@ if "last_run" in st.session_state:
             "Metric": [
                 "NPV score ($MM)", "PV FCF ($MM)", "PV Water ($MM)",
                 "PV Shortfall ($MM)", "PV PVI delay ($MM)", "Total FCF undisc ($MM)",
-                "Capex overage ($MM)", "Mandatory violations", "Mandatory date conflicts",
+                "Capex overage ($MM)", "Prod min shortfall (MCFD)",
+                "FCF shortfall ($MM)", "Mandatory violations",
+                "Mandatory date conflicts",
                 "Water unhandled (Mbbl)",
                 "Mandatory capex overage ($MM)", "Pads ending blocked",
                 "Feasible",
@@ -1284,6 +1278,7 @@ if "last_run" in st.session_state:
                 best_fb.score, best_fb.pv_fcf_mm, best_fb.pv_water_cost_mm,
                 best_fb.pv_shortfall_cost_mm, best_fb.pv_pvi_delay_penalty_mm,
                 best_fb.total_fcf_mm, best_fb.capex_overage_mm,
+                best_fb.prod_min_shortfall_mcfd, best_fb.fcf_shortfall_mm,
                 best_fb.mandatory_violations, best_fb.mandatory_date_conflicts,
                 best_fb.water_unhandled_total_bbl / 1e3,
                 best_fb.mandatory_capex_overage_mm, best_fb.pads_capex_blocked,
@@ -1293,6 +1288,7 @@ if "last_run" in st.session_state:
                 bench_fb.score, bench_fb.pv_fcf_mm, bench_fb.pv_water_cost_mm,
                 bench_fb.pv_shortfall_cost_mm, bench_fb.pv_pvi_delay_penalty_mm,
                 bench_fb.total_fcf_mm, bench_fb.capex_overage_mm,
+                bench_fb.prod_min_shortfall_mcfd, bench_fb.fcf_shortfall_mm,
                 bench_fb.mandatory_violations, bench_fb.mandatory_date_conflicts,
                 bench_fb.water_unhandled_total_bbl / 1e3,
                 bench_fb.mandatory_capex_overage_mm, bench_fb.pads_capex_blocked,
@@ -1353,7 +1349,7 @@ if "last_run" in st.session_state:
                 for p in png_files:
                     st.image(os.path.join(plots_dir, p), caption=p, use_container_width=True)
 
-        # v1.3: Event log viewer
+        # Event log viewer
         event_log_path = os.path.join(out_dir, "event_log_GA.csv")
         if os.path.exists(event_log_path):
             with st.expander("📋 Event Log — Scheduling Decisions", expanded=False):
@@ -1363,7 +1359,6 @@ if "last_run" in st.session_state:
                     "Filter by pad name or event type to trace a specific pad's history."
                 )
                 elog = pd.read_csv(event_log_path)
-                # Filters
                 fc1, fc2 = st.columns(2)
                 pad_filter = fc1.text_input("Filter by pad name (contains)", key="elog_pad_filter")
                 event_types = ["(all)"] + sorted(elog["event"].unique().tolist())
@@ -1376,18 +1371,15 @@ if "last_run" in st.session_state:
                 st.dataframe(filtered, use_container_width=True, hide_index=True, height=400)
 
     # -------------------------------------------------------------------------
-    # TAB 2 — Explore individual generations (best parent of each generation)
+    # TAB 2 — Explore individual generations
     # -------------------------------------------------------------------------
     if active_tab == TAB_EXPLORE:
         st.markdown(
             "Pick a scenario to inspect. **PVI baseline** is the rank-ordered "
             "PVI-greedy schedule used as the GA's benchmark. **Gen N** scenarios "
-            "are each generation's best parent (highest-scoring chromosome from "
-            "that generation's population). The detailed view re-uses the same "
-            "simulator the main run uses."
+            "are each generation's best parent."
         )
 
-        # Build the scenario menu: PVI baseline (if available) + every captured generation.
         PVI_LABEL = "PVI baseline (rank-ordered)"
         gens = sorted(per_gen.keys()) if per_gen else []
         scenario_options: list[str] = []
@@ -1398,7 +1390,6 @@ if "last_run" in st.session_state:
         if not scenario_options:
             st.info("No PVI baseline or per-generation data captured for this run.")
         else:
-            # Quick summary table of every generation's best (unchanged)
             if gens:
                 summary_rows = []
                 for g in gens:
@@ -1424,7 +1415,6 @@ if "last_run" in st.session_state:
                 key="explore_scenario_select",
             )
 
-            # Resolve the selected scenario into (label, order, sim, monthly, score)
             if sel_scenario == PVI_LABEL:
                 scenario_label = "PVI baseline"
                 order_g   = list(bench_order)
@@ -1433,7 +1423,6 @@ if "last_run" in st.session_state:
                 score_g   = float(bench_fb.score) if bench_fb is not None else float("nan")
                 key_tag   = "pvi"
             else:
-                # "Gen N" -> int N
                 sel_gen = int(sel_scenario.split()[-1])
                 rec = per_gen[sel_gen]
                 scenario_label = f"Gen {sel_gen} best"
@@ -1470,7 +1459,6 @@ if "last_run" in st.session_state:
                                   label_prefix=f"{scenario_label} — ",
                                   base_water=base_water)
 
-            # CSV downloads for this scenario
             st.subheader(f"Downloads ({scenario_label})")
             order_df = pd.DataFrame({
                 "drill_position": np.arange(1, len(order_g) + 1), "pad": order_g,
