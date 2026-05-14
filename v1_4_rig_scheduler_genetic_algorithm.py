@@ -3974,12 +3974,15 @@ def make_diagnostic_plots(
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
         fig.suptitle("GA Convergence Diagnostics", fontsize=14, fontweight="bold")
 
+        # Mask for generations where the best-so-far is feasible.
+        # Infeasible generations are nulled out so they don't appear on any plot.
+        _feas = hist["best_feasible"].astype(bool) if "best_feasible" in hist.columns else hist["best_score"] > 0
+
         ax = axes[0, 0]
         # Null out infeasible scores so they don't appear on the plot.
-        _plot_best = hist["best_score"].copy()
+        _plot_best = hist["best_score"].where(_feas)
         _plot_gen  = hist["gen_best_score"].copy()
-        _plot_best[_plot_best < 0] = float("nan")
-        _plot_gen[_plot_gen < 0]   = float("nan")
+        _plot_gen[_plot_gen < 0] = float("nan")
         ax.plot(hist["generation"], _plot_best, "g-", lw=2.5, label="Best so far")
         ax.plot(hist["generation"], _plot_gen, "b--", lw=1, alpha=0.7, label="Gen best")
         m = hist["gen_mean_score_feas"].notna()
@@ -3999,23 +4002,23 @@ def make_diagnostic_plots(
         ax.legend(); ax.grid(alpha=0.3)
 
         ax = axes[1, 0]
-        ax.plot(hist["generation"], hist["best_pv_fcf_mm"], "g-", lw=2, label="PV(FCF)")
-        ax.plot(hist["generation"], hist["best_pv_water_mm"], "b-", lw=2, label="PV(Water)")
-        ax.plot(hist["generation"], hist["best_pv_shortfall_mm"], "r-", lw=2, label="PV(Shortfall)")
+        ax.plot(hist["generation"], hist["best_pv_fcf_mm"].where(_feas), "g-", lw=2, label="PV(FCF)")
+        ax.plot(hist["generation"], hist["best_pv_water_mm"].where(_feas), "b-", lw=2, label="PV(Water)")
+        ax.plot(hist["generation"], hist["best_pv_shortfall_mm"].where(_feas), "r-", lw=2, label="PV(Shortfall)")
         if "best_pv_pvi_penalty_mm" in hist.columns:
-            ax.plot(hist["generation"], hist["best_pv_pvi_penalty_mm"], color="purple", lw=2, label="PV(PVI delay)")
+            ax.plot(hist["generation"], hist["best_pv_pvi_penalty_mm"].where(_feas), color="purple", lw=2, label="PV(PVI delay)")
         # Net NPV line = PV(FCF) - PV(Water) - PV(Shortfall) - PV(PVI delay)
         net = (hist["best_pv_fcf_mm"] - hist["best_pv_water_mm"]
                - hist["best_pv_shortfall_mm"]
                - hist.get("best_pv_pvi_penalty_mm", 0.0))
-        ax.plot(hist["generation"], net, "k-", lw=2.5, alpha=0.8, label="Net NPV")
+        ax.plot(hist["generation"], net.where(_feas), "k-", lw=2.5, alpha=0.8, label="Net NPV")
         ax.set_xlabel("Generation"); ax.set_ylabel("$MM")
         ax.set_title("Best solution — PV components over time")
         ax.legend(); ax.grid(alpha=0.3)
 
         ax = axes[1, 1]
-        ax.plot(hist["generation"], hist["best_total_fcf_mm"], "g--", lw=1.5, label="Undiscounted FCF")
-        ax.plot(hist["generation"], hist["best_pv_fcf_mm"], "g-", lw=2.5, label="PV(FCF) @10%")
+        ax.plot(hist["generation"], hist["best_total_fcf_mm"].where(_feas), "g--", lw=1.5, label="Undiscounted FCF")
+        ax.plot(hist["generation"], hist["best_pv_fcf_mm"].where(_feas), "g-", lw=2.5, label="PV(FCF) @10%")
         ax.set_xlabel("Generation"); ax.set_ylabel("$MM")
         ax.set_title("Discount impact on best solution's FCF")
         ax.legend(); ax.grid(alpha=0.3)
