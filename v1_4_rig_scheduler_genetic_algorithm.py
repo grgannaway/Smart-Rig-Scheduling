@@ -41,7 +41,8 @@ Architecture
                           - PV(Shortfall replacement gas @ $/MCF)
                where PV() discounts each monthly cashflow at `discount_rate_annual`.
 * Hard constraints (capex budget, production ceiling, mandatory pads): violation
-  forces score = -inf so the GA REJECTS those schedules. Toggle each via GAConfig.
+  forces a large negative penalty score so the GA REJECTS those schedules but can
+  still learn from near-feasible solutions. Toggle each via GAConfig.
 * GA maximizes score.
 * Operators  : tournament selection, Order-Crossover (OX), swap + insertion mutation,
                elitism (top-N preserved each generation).
@@ -2924,7 +2925,7 @@ class FitnessBreakdown:
     All $ values are in $MM. PV = present-value (discounted at `discount_rate_annual`).
     """
     score: float                # the value GA maximizes (NPV in $MM)
-    feasible: bool              # False = violated a hard constraint -> score = -inf
+    feasible: bool              # False = violated a hard constraint -> penalized score (< -1e11)
     invalid_reason: str         # explanation if infeasible ("" if feasible)
 
     # Cashflow components (PV $MM)
@@ -3224,13 +3225,51 @@ def _evaluate_ordering(
     feasible = (len(invalid_reasons) == 0)
     invalid_reason = "; ".join(invalid_reasons)
 
+    # NPV-style objective (maximize) — always computed so infeasible solutions
+    # can use it as a tiebreaker for the GA's selection pressure.
+    raw_npv = (pv_fcf_mm - pv_water_cost_mm - pv_shortfall_cost_mm
+               - pv_pvi_delay_penalty_mm)
+
     if not feasible:
-        score = float("-inf")
+        # ---- INFEASIBLE PENALTY RANKING (v1.4) -----------------------------
+        # Instead of -inf (which kills GA learning when all solutions are
+        # infeasible), compute a differentiated penalty score.  The score is
+        # structured so that:
+        #   1. ANY feasible solution always beats ANY infeasible one
+        #      (feasible scores are positive-ish $MM; infeasible < -1e12).
+        #   2. Among infeasible solutions, lower total violation = higher score,
+        #      giving the GA a gradient toward feasibility.
+        #   3. The raw NPV is used as a secondary tiebreaker so that among
+        #      solutions with equal constraint violation, higher NPV wins.
+        #
+        # Violation components (each normalized to ~$MM-equivalent scale):
+        #   - capex_overage_mm: already in $MM
+        #   - prod_min_shortfall_mcfd × 365 × gas_price / 1e6: annualized revenue equiv
+        #   - fcf_shortfall_mm: already in $MM
+        #   - mandatory_violations × 100: flat penalty per slipped pad
+        #   - water_unhandled_total_bbl × avg_water_cost / 1e6: cost equivalent
+        #
+        # The penalty is on a separate scale (-1e12 base) so it can never
+        # overlap with feasible scores (which are typically -1,000 to +20,000).
+        _INFEAS_BASE = -1e12
+
+        # Normalized violation penalty (all terms ≥ 0, in ~$MM-equivalent units)
+        _gas_price = getattr(config, "commodity_price_per_mcf", 3.0)
+        violation_penalty = 0.0
+        violation_penalty += capex_overage_mm * 10.0                           # capex: 10× weight
+        violation_penalty += prod_min_shortfall_mcfd * 365.0 * _gas_price / 1e6  # prod→revenue loss
+        violation_penalty += fcf_shortfall_mm * 5.0                            # FCF: 5× weight
+        violation_penalty += mandatory_violations * 100.0                      # flat per slip
+        if water_unhandled_total_bbl > 0:
+            violation_penalty += water_unhandled_total_bbl * 0.01 / 1e3        # water: ~$10/bbl equiv
+
+        # Score = base offset − violation_penalty + small fraction of raw NPV as tiebreaker.
+        # The raw_npv term is scaled down (÷1e6) so it can never dominate the
+        # violation term — it's purely a secondary ordering among equally-violated
+        # solutions.
+        score = _INFEAS_BASE - violation_penalty + raw_npv / 1e6
     else:
-        # NPV-style objective (maximize):
-        #   score = PV(FCF) - PV(Water) - PV(Shortfall replacement gas) - PV(PVI delay penalty)
-        score = (pv_fcf_mm - pv_water_cost_mm - pv_shortfall_cost_mm
-                 - pv_pvi_delay_penalty_mm)
+        score = raw_npv
 
     return FitnessBreakdown(
         score=score,
@@ -3683,9 +3722,18 @@ class GeneticAlgorithmOptimizer:
             })
             if ga.verbose:
                 feas_tag = "✓" if best_overall[1].feasible else "✗"
+                # Format scores: show "−∞" for legacy -inf, or penalty delta for v1.4 infeasible
+                def _fmt_score(fb):
+                    if fb.feasible:
+                        return f"${fb.score:>11,.1f}MM"
+                    if fb.score == float("-inf"):
+                        return "       −∞MM"
+                    # Show the violation penalty (distance from -1e12 base)
+                    penalty = -(fb.score + 1e12)
+                    return f" infeas score{-penalty:>9,.0f}"
                 print(f"  gen {gen:>3} {feas_tag} | "
-                      f"best=${best_overall[1].score:>11,.1f}MM  "
-                      f"gen_best=${gen_best[1].score:>11,.1f}MM  "
+                      f"best={_fmt_score(best_overall[1])}  "
+                      f"gen_best={_fmt_score(gen_best[1])}  "
                       f"feas={n_feas:>3}/{ga.population_size}  "
                       f"PV_FCF=${best_overall[1].pv_fcf_mm:>9,.1f}MM  "
                       f"PV_H2O=${best_overall[1].pv_water_cost_mm:>7,.2f}MM  "
@@ -3701,7 +3749,10 @@ class GeneticAlgorithmOptimizer:
         if ga.verbose:
             print(f"\n=== GA DONE in {time.time()-t0:.1f}s "
                   f"({len(self._cache)} unique evals) ===")
-            print(f"  Final best NPV score:   ${best_overall[1].score:>13,.2f}MM")
+            _final_score_str = (f"${best_overall[1].score:>13,.2f}MM"
+                                if best_overall[1].feasible
+                                else "(infeasible — see below)")
+            print(f"  Final best NPV score:   {_final_score_str}")
             print(f"  Final PV(FCF):          ${best_overall[1].pv_fcf_mm:>13,.2f}MM")
             print(f"  Final PV(Water cost):   ${best_overall[1].pv_water_cost_mm:>13,.2f}MM")
             print(f"  Final PV(Shortfall):    ${best_overall[1].pv_shortfall_cost_mm:>13,.2f}MM")
@@ -3924,8 +3975,13 @@ def make_diagnostic_plots(
         fig.suptitle("GA Convergence Diagnostics", fontsize=14, fontweight="bold")
 
         ax = axes[0, 0]
-        ax.plot(hist["generation"], hist["best_score"], "g-", lw=2.5, label="Best so far")
-        ax.plot(hist["generation"], hist["gen_best_score"], "b--", lw=1, alpha=0.7, label="Gen best")
+        # Null out infeasible scores so they don't appear on the plot.
+        _plot_best = hist["best_score"].copy()
+        _plot_gen  = hist["gen_best_score"].copy()
+        _plot_best[_plot_best < 0] = float("nan")
+        _plot_gen[_plot_gen < 0]   = float("nan")
+        ax.plot(hist["generation"], _plot_best, "g-", lw=2.5, label="Best so far")
+        ax.plot(hist["generation"], _plot_gen, "b--", lw=1, alpha=0.7, label="Gen best")
         m = hist["gen_mean_score_feas"].notna()
         if m.any():
             ax.plot(hist.loc[m, "generation"], hist.loc[m, "gen_mean_score_feas"],

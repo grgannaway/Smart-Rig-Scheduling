@@ -1300,9 +1300,13 @@ if "last_run" in st.session_state:
         if not history_df.empty:
             st.subheader("GA convergence")
             fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(history_df["generation"], history_df["best_score"],
+            _plot_best = history_df["best_score"].copy()
+            _plot_gen  = history_df["gen_best_score"].copy()
+            _plot_best[_plot_best < 0] = float("nan")
+            _plot_gen[_plot_gen < 0]   = float("nan")
+            ax.plot(history_df["generation"], _plot_best,
                     "g-", lw=2.5, label="Best so far")
-            ax.plot(history_df["generation"], history_df["gen_best_score"],
+            ax.plot(history_df["generation"], _plot_gen,
                     "b--", lw=1.0, alpha=0.7, label="Gen best")
             if "gen_mean_score_feas" in history_df.columns:
                 ax.plot(history_df["generation"], history_df["gen_mean_score_feas"],
